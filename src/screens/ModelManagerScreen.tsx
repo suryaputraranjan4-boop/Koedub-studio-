@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Download, ExternalLink, Trash2 } from 'lucide-react';
+import { Download, ExternalLink, ShieldCheck, Trash2 } from 'lucide-react';
 import { useStudio } from '../state/StudioContext';
 import {
   KeyValueList,
@@ -12,9 +12,10 @@ import {
 import { formatBytes } from '../core/storage/mediaInspector';
 
 export function ModelManagerScreen() {
-  const { models, modelDownloadProgress, downloadModel, removeModel } = useStudio();
+  const { models, modelDownloadProgress, downloadModel, verifyModelCache, removeModel } = useStudio();
   const [stageFilter, setStageFilter] = useState<'all' | 'Prompt 2' | 'Prompt 3'>('all');
   const [selectedId, setSelectedId] = useState<string>(models[0]?.id ?? '');
+  const [verifyingId, setVerifyingId] = useState<string | null>(null);
   const [actionNotice, setActionNotice] = useState<{
     tone: 'success' | 'error';
     title: string;
@@ -45,6 +46,21 @@ export function ModelManagerScreen() {
       title: res.ok ? 'Offline Model Verified' : 'Model Download / Verification Failed',
       description: res.message,
     });
+  };
+
+  const handleVerifyCache = async (modelId: string) => {
+    setActionNotice(null);
+    setVerifyingId(modelId);
+    try {
+      const res = await verifyModelCache(modelId);
+      setActionNotice({
+        tone: res.ok ? 'success' : 'error',
+        title: res.ok ? 'Cache Integrity Verified' : 'Model Cache Missing / Repair Needed',
+        description: res.message,
+      });
+    } finally {
+      setVerifyingId(null);
+    }
   };
 
   const handleRemove = async (modelId: string, name: string) => {
@@ -131,6 +147,8 @@ export function ModelManagerScreen() {
                         label={
                           progress
                             ? `${progress.percent}%`
+                            : model.checksumStatus === 'cache_missing'
+                            ? 'Cache Evicted'
                             : model.installStatus === 'installed_verified'
                             ? 'Ready Offline'
                             : model.repoId
@@ -140,6 +158,8 @@ export function ModelManagerScreen() {
                         tone={
                           progress
                             ? 'active'
+                            : model.checksumStatus === 'cache_missing'
+                            ? 'error'
                             : model.installStatus === 'installed_verified'
                             ? 'nominal'
                             : 'warning'
@@ -269,8 +289,25 @@ export function ModelManagerScreen() {
                     value: selectedModel.availabilityStatus.replace(/_/g, ' '),
                   },
                   {
-                    label: 'Verification Record',
-                    value: selectedModel.integrityHashSha256 ?? 'Not downloaded yet',
+                    label: 'Integrity / Checksum Mode',
+                    value:
+                      selectedModel.checksumStatus === 'verified_sha256'
+                        ? 'SHA-256 Digest Verified (Web Crypto)'
+                        : selectedModel.checksumStatus === 'cache_missing'
+                        ? 'Browser Cache Missing — Re-Download Required'
+                        : selectedModel.runtimeVerified
+                        ? 'Runtime-Verified (No Published Checksum)'
+                        : 'Unverified / Not Downloaded',
+                  },
+                  {
+                    label: 'Computed SHA-256 Digest',
+                    value:
+                      selectedModel.integrityHashSha256 &&
+                      /^[a-f0-9]{64}$/i.test(selectedModel.integrityHashSha256)
+                        ? selectedModel.integrityHashSha256
+                        : selectedModel.repoId
+                        ? 'None (click Verify Cache after download)'
+                        : 'N/A (Built-In Web Audio DSP)',
                     mono: true,
                   },
                 ]}
@@ -283,16 +320,30 @@ export function ModelManagerScreen() {
               <div className="mt-4 flex flex-wrap items-center gap-2.5">
                 {selectedModel.repoId ? (
                   <>
-                    {selectedModel.installStatus === 'installed_verified' ? (
-                      <button
-                        type="button"
-                        disabled={anyDownloading}
-                        onClick={() => void handleRemove(selectedModel.id, selectedModel.name)}
-                        className="min-h-[40px] px-4 py-2 rounded-lg border border-red-200 hover:bg-red-50 disabled:opacity-50 text-red-700 text-xs font-medium inline-flex items-center gap-1.5 whitespace-nowrap"
-                      >
-                        <Trash2 className="w-3.5 h-3.5" aria-hidden="true" />
-                        <span>Remove Local Cache</span>
-                      </button>
+                    {selectedModel.installStatus === 'installed_verified' &&
+                    selectedModel.checksumStatus !== 'cache_missing' ? (
+                      <>
+                        <button
+                          type="button"
+                          disabled={anyDownloading || verifyingId === selectedModel.id}
+                          onClick={() => void handleVerifyCache(selectedModel.id)}
+                          className="min-h-[40px] px-4 py-2 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 disabled:opacity-50 text-slate-800 text-xs font-medium inline-flex items-center gap-1.5 whitespace-nowrap"
+                        >
+                          <ShieldCheck className="w-3.5 h-3.5 text-emerald-700" aria-hidden="true" />
+                          <span>
+                            {verifyingId === selectedModel.id ? 'Verifying Cache…' : 'Verify Cache & SHA-256'}
+                          </span>
+                        </button>
+                        <button
+                          type="button"
+                          disabled={anyDownloading}
+                          onClick={() => void handleRemove(selectedModel.id, selectedModel.name)}
+                          className="min-h-[40px] px-4 py-2 rounded-lg border border-red-200 hover:bg-red-50 disabled:opacity-50 text-red-700 text-xs font-medium inline-flex items-center gap-1.5 whitespace-nowrap"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" aria-hidden="true" />
+                          <span>Remove Local Cache</span>
+                        </button>
+                      </>
                     ) : (
                       <button
                         type="button"
@@ -304,6 +355,8 @@ export function ModelManagerScreen() {
                         <span>
                           {activeProgress
                             ? `Downloading (${activeProgress.percent}%)…`
+                            : selectedModel.checksumStatus === 'cache_missing'
+                            ? 'Repair & Re-Download Model'
                             : 'Download & Verify Offline'}
                         </span>
                       </button>

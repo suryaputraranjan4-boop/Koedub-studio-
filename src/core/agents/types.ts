@@ -94,6 +94,8 @@ export interface PlannedTask {
   memoryTier: AgentMemoryTier;
   retryCount: number;
   maxRetries: number;
+  lastRetryReason?: string | null;
+  executionEngine?: string | null;
   startedAt: string | null;
   completedAt: string | null;
   outputSummary: string;

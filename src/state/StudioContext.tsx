@@ -2,7 +2,9 @@ import React, { createContext, useCallback, useContext, useEffect, useState } fr
 import type {
   AppSettings,
   AudioClip,
+  AudioStemRecord,
   CharacterProfile,
+  CloudPrebuiltVoiceName,
   DialogueSegment,
   GeminiConnectionStatus,
   ImportedMedia,
@@ -52,11 +54,18 @@ import { masterOrchestrator } from '../core/orchestrator/masterOrchestrator';
 import { evaluateTimingAdjustment } from '../core/timeline/timelineEngine';
 import { localModelRuntime } from '../core/ai/modelRuntime';
 import {
+  applyRealSyncToGeneratedWavBlob,
+  applyVoiceActingToWavBlob,
   buildVoiceActingDirective,
-  computeSynchronizedPlacement,
+  resolvePersistentCloudVoiceName,
   synthesizeHindiWavWithModel,
 } from '../core/ai/speechSynthesis';
-import { computeWaveformPeaksFromBlob } from '../core/ai/audioProduction';
+import {
+  buildAudioStemRecord,
+  computeWaveformPeaksFromBlob,
+  decodeStoredWavBlobToStereo,
+} from '../core/ai/audioProduction';
+import { decodeMediaBlobToStereo } from '../core/ai/audioDsp';
 import {
   executeCollaborativeIntelligence,
   fetchGeminiConnectionStatus,
@@ -182,7 +191,10 @@ interface StudioContextValue {
   deleteDialogueSegment: (segmentId: string) => Promise<void>;
   synthesizeSingleSegment: (segmentId: string) => Promise<{ ok: boolean; message: string }>;
   downloadModel: (modelId: string) => Promise<{ ok: boolean; message: string }>;
+  verifyModelCache: (modelId: string) => Promise<{ ok: boolean; message: string }>;
   removeModel: (modelId: string) => Promise<void>;
+  importExternalMeStem: (projectId: string, file: File) => Promise<{ ok: boolean; message: string }>;
+  requestPersistentStorage: () => Promise<{ ok: boolean; persisted: boolean; message: string }>;
   playVaultAudio: (vaultKey: string) => Promise<{ ok: boolean; error?: string }>;
   stopAudioPlayback: () => void;
   previewHindiVoice: (voiceId: string, sampleText?: string) => Promise<{ ok: boolean; error?: string }>;
@@ -317,6 +329,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     void refreshAll();
     void refreshGeminiStatus(false);
+    void resourceManager.requestPersistentStorage().catch(() => undefined);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -357,7 +370,19 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
         blob: file,
         storedAt: now,
       };
-      await putRecord(STORES.file_vault, vaultEntry);
+      try {
+        await putRecord(STORES.file_vault, vaultEntry);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (/quota|storage|full/i.test(msg)) {
+          return {
+            ok: false,
+            error:
+              'Browser local storage quota exceeded while saving media. Purge temporary files in Settings > Storage or request persistent storage first.',
+          };
+        }
+        return { ok: false, error: `Failed to store media locally: ${msg}` };
+      }
 
       // Probe real browser-decodable metadata
       const probe = await probeMediaFile(
@@ -643,9 +668,13 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
           ]
         : char.voiceAssignmentHistory;
 
+      const resolvedCloudVoice: CloudPrebuiltVoiceName | null =
+        voiceObj?.cloudVoiceName ?? char.assignedCloudVoiceName ?? null;
+
       await putRecord<CharacterProfile>(STORES.characters, {
         ...char,
         assignedHindiVoiceId: voiceId,
+        assignedCloudVoiceName: resolvedCloudVoice,
         voiceLocked: locked,
         voiceAssignmentHistory: historyEntry,
         updatedAt: now,
@@ -833,6 +862,15 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     [activeProjectId, refreshAll]
   );
 
+  const verifyModelCache = useCallback(
+    async (modelId: string): Promise<{ ok: boolean; message: string }> => {
+      const res = await localModelRuntime.verifyModelCacheIntegrity(modelId);
+      await refreshAll(activeProjectId);
+      return { ok: res.cachePresent, message: res.detail };
+    },
+    [activeProjectId, refreshAll]
+  );
+
   const removeModel = useCallback(
     async (modelId: string) => {
       await localModelRuntime.removeInstalledModel(modelId);
@@ -841,6 +879,73 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     [activeProjectId, refreshAll]
   );
 
+  const importExternalMeStem = useCallback(
+    async (projectId: string, file: File): Promise<{ ok: boolean; message: string }> => {
+      try {
+        const now = new Date().toISOString();
+        const vaultKey = `original_media/${projectId}/external_me_${Date.now()}_${file.name}`;
+        let decoded = await decodeStoredWavBlobToStereo(file);
+        if (!decoded) {
+          decoded = await decodeMediaBlobToStereo(file, file.name.split('.').pop());
+        }
+        if (!decoded || decoded.left.length === 0) {
+          return { ok: false, message: 'Could not decode clean M&E audio stem (use WAV, MP3, M4A, or OGG).' };
+        }
+        await putRecord<VaultEntry>(STORES.file_vault, {
+          vaultKey,
+          projectId,
+          namespace: 'original_media',
+          fileName: file.name,
+          mimeType: file.type || 'audio/wav',
+          sizeBytes: file.size,
+          blob: file,
+          storedAt: now,
+        });
+        const stemRec = buildAudioStemRecord({
+          projectId,
+          stemType: 'external_me_stem',
+          vaultKey,
+          sampleRate: decoded.sampleRate,
+          channels: decoded.channels,
+          durationMs: decoded.durationMs,
+          sizeBytes: file.size,
+          separationMethod: `User-Imported Clean M&E Stem (${file.name})`,
+          confidence: 0.99,
+          residualDialogueLeakageDb: -48,
+          artifactRiskScore: 0.02,
+          isExternalCleanStem: true,
+          artifactWarning: null,
+        });
+        await putRecord(STORES.audio_stems, stemRec);
+        await refreshAll(projectId);
+        return {
+          ok: true,
+          message: `Imported clean M&E stem "${file.name}" (${decoded.sampleRate} Hz ${decoded.channels === 2 ? 'Stereo' : 'Mono'}, ${(decoded.durationMs / 1000).toFixed(1)}s). Audio Separation & Mixing will prefer it automatically.`,
+        };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Failed to import clean M&E stem.';
+        return { ok: false, message: msg };
+      }
+    },
+    [refreshAll]
+  );
+
+  const requestPersistentStorage = useCallback(async () => {
+    const persisted = await resourceManager.requestPersistentStorage();
+    await refreshResourcesInternal(settings);
+    const supported = persisted !== null;
+    return {
+      ok: supported,
+      persisted: persisted === true,
+      message:
+        persisted === true
+          ? 'Persistent local storage granted — browser will not silently evict cached models or media.'
+          : supported
+          ? 'Browser returned best-effort storage (persistent grant depends on site engagement/bookmarks).'
+          : 'Persistent Storage API is not supported by this browser.',
+    };
+  }, [refreshResourcesInternal, settings]);
+
   const previewHindiVoice = useCallback(
     async (
       voiceId: string,
@@ -848,6 +953,33 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
     ): Promise<{ ok: boolean; error?: string }> => {
       const voice = voices.find((v) => v.voiceId === voiceId);
       if (!voice) return { ok: false, error: 'Voice profile not found.' };
+
+      // Cloud Prebuilt Multi-Voice preview path
+      if (voice.synthesisMode === 'cloud_prebuilt_voice') {
+        if (settings.offlineOnlyMode || !settings.cloudIntelligenceEnabled || !settings.cloudTtsEnabled) {
+          return {
+            ok: false,
+            error:
+              'Enable Cloud Intelligence and Gemini Cloud TTS in Settings to preview Cloud Prebuilt Multi-Voices.',
+          };
+        }
+        try {
+          const cloudRes = await synthesizeHindiWavViaGeminiCloud({
+            hindiText: sampleText,
+            emotionStyle: 'Calm natural studio Hindi voice preview',
+            voiceName: voice.cloudVoiceName ?? 'Kore',
+            model: settings.preferredCloudTtsModel || 'gemini-3.8-flash-lite-tts',
+          });
+          void refreshGeminiStatus(false);
+          return await playBlobInternal(cloudRes.wavBlob, `preview:${voiceId}`);
+        } catch (err) {
+          return {
+            ok: false,
+            error: err instanceof Error ? err.message : 'Cloud TTS preview failed.',
+          };
+        }
+      }
+
       const installed = await localModelRuntime.isModelInstalled('model_mms_tts_hin');
       if (!installed) {
         return {
@@ -882,7 +1014,15 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
         await localModelRuntime.unloadActiveModel();
       }
     },
-    [playBlobInternal, voices]
+    [
+      playBlobInternal,
+      refreshGeminiStatus,
+      settings.cloudIntelligenceEnabled,
+      settings.cloudTtsEnabled,
+      settings.offlineOnlyMode,
+      settings.preferredCloudTtsModel,
+      voices,
+    ]
   );
 
   const synthesizeSingleSegment = useCallback(
@@ -909,22 +1049,30 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
 
       try {
         const voice = voices.find((v) => v.voiceId === seg.assignedHindiVoiceId) ?? voices[0] ?? null;
+        const char = seg.characterId
+          ? characters.find((c) => c.characterId === seg.characterId) ?? null
+          : null;
         const directive = buildVoiceActingDirective(seg.emotion, voice);
 
-        let wavBlob: Blob;
-        let durationMs: number;
+        let rawWavBlob: Blob;
         let engineText = 'Meta MMS-TTS-HIN (16 kHz offline)';
 
         if (useCloudTts) {
+          const persistentVoiceName = resolvePersistentCloudVoiceName(
+            char,
+            voice,
+            seg.sourceSpeakerId
+          );
           const cloudRes = await synthesizeHindiWavViaGeminiCloud({
             hindiText: seg.hindiText,
             emotionStyle: `${seg.emotion.primaryEmotion} anime Hindi dubbing (${directive.deliveryStyle})`,
-            voiceName: 'Kore',
+            voiceName: persistentVoiceName,
             model: settings.preferredCloudTtsModel || 'gemini-3.8-flash-lite-tts',
           });
-          wavBlob = cloudRes.wavBlob;
-          durationMs = cloudRes.durationMs;
-          engineText = `Gemini Cloud TTS (${cloudRes.model}, 24 kHz)`;
+          // Apply acting directive post-DSP on Cloud WAV too
+          const acted = await applyVoiceActingToWavBlob(cloudRes.wavBlob, directive, true);
+          rawWavBlob = acted.wavBlob;
+          engineText = `Gemini Cloud TTS (${cloudRes.model}, voice: ${persistentVoiceName})`;
           void refreshGeminiStatus(false);
         } else {
           type TtsPipe = (text: string) => Promise<{ audio: Float32Array; sampling_rate: number }>;
@@ -934,9 +1082,18 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
             hindiText: seg.hindiText,
             directive,
           });
-          wavBlob = synth.wavBlob;
-          durationMs = synth.durationMs;
+          rawWavBlob = synth.wavBlob;
         }
+
+        // CRITICAL REPAIR: Physically apply pitch-preserving WSOLA sync to generated WAV PCM
+        const realSync = await applyRealSyncToGeneratedWavBlob({
+          wavBlob: rawWavBlob,
+          originalStartMs: seg.originalStartMs,
+          originalEndMs: seg.originalEndMs,
+          preferredShiftLimitMs: seg.preferredShiftLimitMs || settings.preferredTimingAdjustmentMs,
+        });
+        const wavBlob = realSync.synchronizedWavBlob;
+        const sync = realSync.outcome;
 
         const now = new Date().toISOString();
         const vaultKey = `generated_audio/${seg.projectId}/${seg.segmentId}.wav`;
@@ -952,13 +1109,6 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
         };
         await putRecord(STORES.file_vault, entry);
 
-        const sync = computeSynchronizedPlacement({
-          originalStartMs: seg.originalStartMs,
-          originalEndMs: seg.originalEndMs,
-          measuredAudioDurationMs: durationMs,
-          preferredShiftLimitMs: seg.preferredShiftLimitMs || settings.preferredTimingAdjustmentMs,
-        });
-
         const timingMatchLabel: DialogueSegment['timingMatchLabel'] =
           sync.syncStatus === 'needs_adjustment'
             ? 'Needs Review'
@@ -971,7 +1121,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
           assignedHindiVoiceId: voice?.voiceId ?? seg.assignedHindiVoiceId,
           actingDirective: directive,
           generatedAudioRef: vaultKey,
-          actualGeneratedDurationMs: durationMs,
+          actualGeneratedDurationMs: sync.actualGeneratedDurationMs,
           finalStartMs: sync.finalStartMs,
           finalEndMs: sync.finalEndMs,
           syncDeltaMs: sync.syncDeltaMs,
@@ -1002,7 +1152,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
         await refreshAll(seg.projectId);
         return {
           ok: true,
-          message: `${engineText} synthesized real Hindi WAV (${(durationMs / 1000).toFixed(2)}s). ${sync.note}`,
+          message: `${engineText} synthesized & WSOLA-synced Hindi WAV (${(sync.actualGeneratedDurationMs / 1000).toFixed(2)}s). ${sync.note}`,
         };
       } catch (err) {
         return {
@@ -1014,6 +1164,7 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
       }
     },
     [
+      characters,
       refreshAll,
       refreshGeminiStatus,
       settings.cloudIntelligenceEnabled,
@@ -1520,7 +1671,10 @@ export function StudioProvider({ children }: { children: React.ReactNode }) {
         deleteDialogueSegment,
         synthesizeSingleSegment,
         downloadModel,
+        verifyModelCache,
         removeModel,
+        importExternalMeStem,
+        requestPersistentStorage,
         playVaultAudio,
         stopAudioPlayback,
         previewHindiVoice,

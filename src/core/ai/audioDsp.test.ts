@@ -5,9 +5,13 @@ import {
   applyPostSynthesisDsp,
   clusterSpeakerIntervals,
   decodePcmWavBuffer,
+  decodePcmWavBufferStereo,
   detectVoiceActivitySegments,
   encodeFloat32ToWavBuffer,
+  encodeStereoToWavBuffer,
+  extractMono16kChunkFromStereo,
   measureSamplesDurationMs,
+  timeStretchPcmWSOLA,
 } from './audioDsp';
 
 function generateSine(
@@ -39,6 +43,51 @@ describe('Audio DSP & Speaker Diarization Engine', () => {
     assert.equal(decoded.samples.length, 24000);
     assert.equal(decoded.durationMs, 1500);
     assert.equal(measureSamplesDurationMs(decoded.samples.length, decoded.sampleRate), 1500);
+  });
+
+  it('encodes and decodes native 48 kHz stereo PCM WAV without collapsing stereo width', () => {
+    const sr = 48000;
+    const left = generateSine(220, 0.5, sr, 0.4);
+    const right = generateSine(440, 0.5, sr, 0.4);
+    const buf = encodeStereoToWavBuffer(left, right, sr);
+    const decoded = decodePcmWavBufferStereo(buf);
+
+    assert.ok(decoded, 'Stereo WAV decode should succeed');
+    assert.equal(decoded.sampleRate, 48000);
+    assert.equal(decoded.channels, 2);
+    assert.equal(decoded.durationMs, 500);
+    assert.equal(decoded.left.length, 24000);
+    assert.equal(decoded.right.length, 24000);
+
+    // Stereo channels must stay distinct (not collapsed to mono)
+    let lrDiff = 0;
+    for (let i = 0; i < 1000; i += 1) {
+      lrDiff += Math.abs(decoded.left[i] - decoded.right[i]);
+    }
+    assert.ok(lrDiff > 50, 'Expected distinct L/R stereo channels');
+
+    // 16 kHz mono chunk slice extracts exact requested window cleanly
+    const mono16k = extractMono16kChunkFromStereo(decoded, 100, 350);
+    assert.equal(mono16k.sampleRate, 16000);
+    assert.ok(Math.abs(mono16k.samples.length - 4000) <= 16);
+  });
+
+  it('physically stretches PCM duration with pitch-preserving WSOLA bounded to [0.88, 1.15]', () => {
+    const sr = 24000;
+    const input = generateSine(200, 1.5, sr, 0.45);
+    const faster = timeStretchPcmWSOLA(input, sr, 1.12);
+    const expectedLen = Math.round(input.length / 1.12);
+    assert.ok(
+      Math.abs(faster.samples.length - expectedLen) <= Math.round(sr * 0.04),
+      `Expected ~${expectedLen} samples for 1.12x WSOLA, got ${faster.samples.length}`
+    );
+
+    // Ensure no digital clipping introduced by WSOLA overlap-add
+    let peak = 0;
+    for (let i = 0; i < faster.samples.length; i += 1) {
+      peak = Math.max(peak, Math.abs(faster.samples[i]));
+    }
+    assert.ok(peak <= 0.99, `Expected WSOLA peak <= 0.99, got ${peak}`);
   });
 
   it('detects real speech intervals via VAD and returns empty array on silence', () => {

@@ -59,11 +59,13 @@ export function SettingsStorageScreen() {
     refreshResources,
     refreshGeminiStatus,
     purgeTemporaryStorage,
+    requestPersistentStorage,
   } = useStudio();
 
   const [purgeMessage, setPurgeMessage] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [testingCloud, setTestingCloud] = useState(false);
+  const [persistingStorage, setPersistingStorage] = useState(false);
 
   const handleRefresh = async () => {
     setRefreshing(true);
@@ -89,6 +91,25 @@ export function SettingsStorageScreen() {
       `Cleared temporary processing files (${formatBytes(reclaimed)} reclaimed). Preserved original imported media untouched.`
     );
   };
+
+  const handleRequestPersistent = async () => {
+    setPersistingStorage(true);
+    try {
+      const res = await requestPersistentStorage();
+      setPurgeMessage(res.message);
+    } finally {
+      setPersistingStorage(false);
+    }
+  };
+
+  const textModelOptions =
+    geminiStatus?.availableTextModels && geminiStatus.availableTextModels.length > 0
+      ? geminiStatus.availableTextModels
+      : ['gemini-4-hydrogen', 'gemini-3.1-flash-lite'];
+  const ttsModelOptions =
+    geminiStatus?.availableTtsModels && geminiStatus.availableTtsModels.length > 0
+      ? geminiStatus.availableTtsModels
+      : ['gemini-3.8-flash-lite-tts', 'gemini-3.8-flash-tts'];
 
   const namespaces = resources?.storage.namespaces;
 
@@ -230,7 +251,12 @@ export function SettingsStorageScreen() {
                       }
                       className="w-full h-10 px-2.5 rounded-lg border border-slate-300 bg-white text-xs font-mono"
                     >
-                      <option value="gemini-4-hydrogen">gemini-4-hydrogen (Recommended)</option>
+                      {textModelOptions.map((m) => (
+                        <option key={m} value={m}>
+                          {m}
+                          {m === 'gemini-4-hydrogen' ? ' (Recommended)' : ''}
+                        </option>
+                      ))}
                     </select>
                   </div>
                 </div>
@@ -246,7 +272,7 @@ export function SettingsStorageScreen() {
                   />
                   <span>
                     <strong className="text-slate-900">Enable Optional Gemini Cloud TTS</strong> —
-                    Use expressive 24 kHz Gemini Cloud TTS when online instead of local Meta MMS-TTS-HIN.
+                    Use expressive multi-voice Gemini Cloud TTS when online instead of local Meta MMS-TTS-HIN.
                   </span>
                 </label>
 
@@ -265,8 +291,12 @@ export function SettingsStorageScreen() {
                     }
                     className="w-full h-10 px-2.5 rounded-lg border border-slate-300 bg-white text-xs font-mono"
                   >
-                    <option value="gemini-3.8-flash-lite-tts">gemini-3.8-flash-lite-tts (Low Latency)</option>
-                    <option value="gemini-3.8-flash-tts">gemini-3.8-flash-tts (Expressive)</option>
+                    {ttsModelOptions.map((m) => (
+                      <option key={m} value={m}>
+                        {m}
+                        {m === 'gemini-3.8-flash-lite-tts' ? ' (Low Latency)' : ' (Expressive)'}
+                      </option>
+                    ))}
                   </select>
                 </div>
 
@@ -307,12 +337,19 @@ export function SettingsStorageScreen() {
                     <KeyValueList
                       items={[
                         {
-                          label: 'Session Gemini Requests',
+                          label: 'Model Discovery Source',
+                          value:
+                            geminiStatus.modelDiscoverySource === 'live_api'
+                              ? 'Live Gemini API (models.list)'
+                              : 'Verified Model Registry',
+                        },
+                        {
+                          label: 'This Session Gemini Requests',
                           value: `${geminiStatus.usage.totalRequests} reasoning · ${geminiStatus.usage.ttsRequests} TTS`,
                           mono: true,
                         },
                         {
-                          label: 'Session Token Accounting',
+                          label: 'This Session Token Accounting',
                           value: `${geminiStatus.usage.totalInputTokens} in · ${geminiStatus.usage.totalOutputTokens} out`,
                           mono: true,
                         },
@@ -356,6 +393,12 @@ export function SettingsStorageScreen() {
                   value: resources ? formatBytes(resources.storage.availableBytes) : 'Measuring…',
                   mono: true,
                 },
+                {
+                  label: 'Browser Persistence Mode',
+                  value: resources?.storagePersisted
+                    ? 'Persistent Granted (Eviction Protected)'
+                    : 'Best-Effort (Browser May Evict Under Pressure)',
+                },
               ]}
             />
 
@@ -373,7 +416,7 @@ export function SettingsStorageScreen() {
               ))}
             </div>
 
-            <div className="mt-5 pt-4 border-t border-slate-100">
+            <div className="mt-5 pt-4 border-t border-slate-100 flex flex-wrap items-center gap-2.5">
               <button
                 type="button"
                 onClick={() => void handlePurgeTemp()}
@@ -382,6 +425,16 @@ export function SettingsStorageScreen() {
                 <Trash2 className="w-3.5 h-3.5 text-slate-600" aria-hidden="true" />
                 <span>Clear Temporary Processing Data Only</span>
               </button>
+              {!resources?.storagePersisted ? (
+                <button
+                  type="button"
+                  disabled={persistingStorage}
+                  onClick={() => void handleRequestPersistent()}
+                  className="min-h-[40px] px-4 py-2 rounded-lg border border-blue-200 bg-blue-50 hover:bg-blue-100 disabled:opacity-50 text-xs font-medium text-blue-800 whitespace-nowrap"
+                >
+                  {persistingStorage ? 'Requesting…' : 'Request Persistent Storage'}
+                </button>
+              ) : null}
             </div>
           </Surface>
         </div>

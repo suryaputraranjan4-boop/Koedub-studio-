@@ -13,6 +13,7 @@ import {
   Sliders,
   Square,
   Undo2,
+  Upload,
   Volume2,
   ZoomIn,
   ZoomOut,
@@ -111,6 +112,7 @@ export function AudioStudioScreen() {
     mixProjectMasterAudio,
     exportProjectAsset,
     regenerateCharacterDialogues,
+    importExternalMeStem,
   } = useStudio();
 
   const [history, setHistory] = useState<TimelineHistoryState>(() =>
@@ -207,7 +209,11 @@ export function AudioStudioScreen() {
     : null;
 
   const originalVaultKey = activeBundle.media?.vaultKey ?? null;
-  const backgroundStem = activeBundle.audioStems.find((s) => s.stemType === 'background_stem') ?? null;
+  const externalMeStem = activeBundle.audioStems.find((s) => s.stemType === 'external_me_stem') ?? null;
+  const backgroundStem =
+    externalMeStem ??
+    activeBundle.audioStems.find((s) => s.stemType === 'background_stem') ??
+    null;
   const finalMixStem = activeBundle.audioStems.find((s) => s.stemType === 'final_mix') ?? null;
 
   const dialogueTrack = tracks.find((t) => t.kind === 'dialogue');
@@ -301,6 +307,18 @@ export function AudioStudioScreen() {
     setActionNotice({
       tone: res.ok ? 'success' : 'error',
       title: res.ok ? 'Export Ready' : 'Export Unavailable',
+      description: res.message,
+    });
+  };
+
+  const handleImportCleanMe = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    const res = await importExternalMeStem(activeBundle.project.id, file);
+    setActionNotice({
+      tone: res.ok ? 'success' : 'error',
+      title: res.ok ? 'Clean M&E Stem Imported' : 'M&E Stem Import Failed',
       description: res.message,
     });
   };
@@ -425,8 +443,29 @@ export function AudioStudioScreen() {
               ) : (
                 <Play className="w-3.5 h-3.5" aria-hidden="true" />
               )}
-              <span>Background M&amp;E Stem</span>
+              <span>
+                {externalMeStem
+                  ? `Clean M&E (${Math.round(externalMeStem.sampleRate / 100) / 10} kHz ${
+                      (externalMeStem.channels ?? 2) >= 2 ? 'Stereo' : 'Mono'
+                    })`
+                  : backgroundStem
+                  ? `Background M&E (${Math.round(backgroundStem.sampleRate / 100) / 10} kHz ${
+                      (backgroundStem.channels ?? 2) >= 2 ? 'Stereo' : 'Mono'
+                    })`
+                  : 'Background M&E Stem'}
+              </span>
             </button>
+
+            <label className="min-h-[36px] px-3 py-1.5 rounded-lg text-xs font-medium inline-flex items-center gap-1.5 border border-slate-300 bg-white hover:bg-slate-50 text-slate-700 cursor-pointer whitespace-nowrap">
+              <Upload className="w-3.5 h-3.5" aria-hidden="true" />
+              <span>{externalMeStem ? 'Replace Clean M&E' : 'Import Clean M&E'}</span>
+              <input
+                type="file"
+                accept=".wav,.mp3,.m4a,.ogg,.flac,audio/*"
+                onChange={(e) => void handleImportCleanMe(e)}
+                className="sr-only"
+              />
+            </label>
 
             <button
               type="button"
@@ -445,7 +484,13 @@ export function AudioStudioScreen() {
               ) : (
                 <Volume2 className="w-3.5 h-3.5" aria-hidden="true" />
               )}
-              <span>Final Dub Master</span>
+              <span>
+                {finalMixStem
+                  ? `Final Dub Master (${Math.round(finalMixStem.sampleRate / 100) / 10} kHz ${
+                      (finalMixStem.channels ?? 2) >= 2 ? 'Stereo' : 'Mono'
+                    })`
+                  : 'Final Dub Master'}
+              </span>
             </button>
 
             <div

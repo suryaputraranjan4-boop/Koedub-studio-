@@ -23,21 +23,27 @@ export function buildSrtSubtitles(
   segments: DialogueSegment[],
   language: 'hi' | 'ja' = 'hi'
 ): string {
-  const sorted = [...segments].sort((a, b) => a.finalStartMs - b.finalStartMs);
+  const sorted = [...segments].sort((a, b) =>
+    language === 'hi'
+      ? a.finalStartMs - b.finalStartMs
+      : a.originalStartMs - b.originalStartMs
+  );
   const blocks: string[] = [];
+  let cueNumber = 1;
 
-  sorted.forEach((seg, idx) => {
+  for (const seg of sorted) {
     const startMs = language === 'hi' ? seg.finalStartMs : seg.originalStartMs;
     const endMs = Math.max(
       startMs + 200,
       language === 'hi' ? seg.finalEndMs : seg.originalEndMs
     );
     const text = (language === 'hi' ? seg.hindiText : seg.japaneseText).trim();
-    if (!text) return;
+    if (!text) continue;
     blocks.push(
-      `${idx + 1}\n${formatSrtTimestamp(startMs)} --> ${formatSrtTimestamp(endMs)}\n${text}\n`
+      `${cueNumber}\n${formatSrtTimestamp(startMs)} --> ${formatSrtTimestamp(endMs)}\n${text}\n`
     );
-  });
+    cueNumber += 1;
+  }
 
   return blocks.join('\n');
 }

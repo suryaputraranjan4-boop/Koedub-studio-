@@ -10,8 +10,10 @@ import { computeMultimodalFaceVoiceMatches } from './visualIntelligence';
 import {
   buildVoiceActingDirective,
   computeSynchronizedPlacement,
+  resolvePersistentCloudVoiceName,
   selectBestVoiceForCharacter,
 } from './speechSynthesis';
+import { computeHindiTokenOverlap } from './intelligenceRouter';
 import type {
   CharacterProfile,
   DialogueSegment,
@@ -306,5 +308,83 @@ describe('Language, Relationship, Multimodal & Synchronization Intelligence', ()
     assert.equal(tooLong.appliedSpeedMultiplier, 1.15);
     assert.equal(tooLong.reviewStatus, 'needs_review');
     assert.equal(tooLong.syncStatus, 'needs_adjustment');
+  });
+
+  it('prevents SPK_01 collisions across unrelated series scopes in multimodal matching', () => {
+    const otherSeriesChar = makeCharacter({
+      characterId: 'CHR-OTHER',
+      projectId: 'prj_other',
+      seriesScope: 'Unrelated Anime Series',
+      displayName: 'Other Hero',
+      associatedSpeakerIds: ['SPK_01'],
+    });
+    const speakers: Speaker[] = [
+      {
+        id: 'spk_new',
+        projectId: 'prj_new',
+        speakerLabel: 'SPK_01',
+        internalSpeakerId: 'spk_prj_new_SPK_01',
+        roleType: 'on_screen',
+        totalDurationMs: 4000,
+        segmentCount: 2,
+        estimatedPitchHz: 132,
+        matchedCharacterId: null,
+        matchConfidence: 0.78,
+        reviewStatus: 'needs_review',
+      },
+    ];
+    const res = computeMultimodalFaceVoiceMatches({
+      projectId: 'prj_new',
+      seriesScope: 'Brand New Anime',
+      speakers,
+      speakerTurnTimestamps: { SPK_01: [{ startMs: 0, endMs: 1500 }] },
+      visualTracks: [],
+      existingCharacters: [otherSeriesChar],
+    });
+    assert.equal(res.associations.length, 1);
+    assert.notEqual(
+      res.associations[0].characterId,
+      'CHR-OTHER',
+      'Must never collide SPK_01 with a character from a different seriesScope'
+    );
+  });
+
+  it('computes honest Hindi token overlap and resolves deterministic persistent cloud voices', () => {
+    const identical = computeHindiTokenOverlap('तुम बिल्कुल सही कह रहे हो', 'तुम बिल्कुल सही कह रहे हो');
+    const divergent = computeHindiTokenOverlap('तुम बिल्कुल सही कह रहे हो', 'आज मौसम बहुत अच्छा है');
+    assert.equal(identical, 1);
+    assert.ok(divergent < 0.25);
+
+    const deepMale = makeCharacter({
+      characterId: 'CHR-M',
+      assignedCloudVoiceName: null,
+      voiceCharacteristics: {
+        pitchRange: '105–125 Hz',
+        timbre: 'Deep',
+        pacing: 'Slow',
+        ageEstimate: 'Adult',
+        genderPresentation: 'Masculine-leaning',
+        pitchMeanHz: 112,
+      },
+    });
+    const highFemale = makeCharacter({
+      characterId: 'CHR-F',
+      assignedCloudVoiceName: null,
+      voiceCharacteristics: {
+        pitchRange: '220–260 Hz',
+        timbre: 'Bright',
+        pacing: 'Fast',
+        ageEstimate: 'Youth',
+        genderPresentation: 'Feminine-leaning',
+        pitchMeanHz: 245,
+      },
+    });
+    const vMale = resolvePersistentCloudVoiceName(deepMale, null, 'CHR-M');
+    const vFemale = resolvePersistentCloudVoiceName(highFemale, null, 'CHR-F');
+    assert.notEqual(vMale, vFemale, 'Distinct voice characters should not collapse onto a single hardcoded voice');
+
+    // Explicit assignedCloudVoiceName is preserved permanently
+    const locked = makeCharacter({ assignedCloudVoiceName: 'Fenrir' });
+    assert.equal(resolvePersistentCloudVoiceName(locked, null, 'CHR-L'), 'Fenrir');
   });
 });

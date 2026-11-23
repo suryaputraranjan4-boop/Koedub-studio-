@@ -60,6 +60,16 @@ export function QualityAssuranceScreen() {
     }
   };
 
+  const renderIssueMeta = (issue: QAIssue) => (
+    <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-slate-500 font-mono">
+      {issue.responsibleAgent ? <span>Agent: {issue.responsibleAgent}</span> : null}
+      {issue.resolutionState ? (
+        <span>· State: {issue.resolutionState.replace(/_/g, ' ')}</span>
+      ) : null}
+      {issue.evidence ? <span className="truncate max-w-full">· {issue.evidence}</span> : null}
+    </div>
+  );
+
   const renderIssueActions = (issue: QAIssue) => {
     if (!issue.segmentId && !issue.clipId) return null;
     return (
@@ -168,6 +178,13 @@ export function QualityAssuranceScreen() {
             <KeyValueList
               items={[
                 {
+                  label: 'Master Format',
+                  value: `${acoustic.channels ?? 1}ch ${
+                    (acoustic.channels ?? 1) >= 2 ? 'Stereo' : 'Mono'
+                  } · ${acoustic.sampleRate ?? 0} Hz`,
+                  mono: true,
+                },
+                {
                   label: 'True Peak Level',
                   value: `${acoustic.peakDbfs} dBFS`,
                   mono: true,
@@ -192,26 +209,80 @@ export function QualityAssuranceScreen() {
                   mono: true,
                 },
                 {
+                  label: 'Residual Dialogue Leakage',
+                  value:
+                    latestReport?.residualDialogueLeakageDb !== null &&
+                    latestReport?.residualDialogueLeakageDb !== undefined
+                      ? `${latestReport.residualDialogueLeakageDb} dB`
+                      : 'Unmeasured',
+                  mono: true,
+                },
+                {
                   label: 'WAV Export Integrity',
                   value: acoustic.exportIntegrityVerified ? 'Verified RIFF/PCM' : 'Unverified',
                 },
                 {
-                  label: 'Dialogue / Background Balance',
-                  value:
-                    acoustic.dialogueToBackgroundDb !== null
-                      ? `${acoustic.dialogueToBackgroundDb >= 0 ? '+' : ''}${acoustic.dialogueToBackgroundDb} dB`
-                      : 'N/A (No mixed Hindi clip)',
+                  label: 'QA Auto-Correction Cycles',
+                  value: `${latestReport?.correctionCyclesRun ?? 0} / 2 max`,
                   mono: true,
                 },
               ]}
             />
           </div>
-          {latestReport?.semanticReviewSummary ? (
-            <p className="mt-4 pt-3 border-t border-slate-100 text-xs text-slate-600 leading-relaxed">
-              <span className="font-medium text-slate-800">Semantic QA Summary:</span>{' '}
-              {latestReport.semanticReviewSummary}
-            </p>
+          {latestReport?.semanticQAResult ? (
+            <div className="mt-4 pt-3 border-t border-slate-100 text-xs text-slate-600 space-y-1">
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-medium text-slate-800">
+                  Independent Semantic QA Pass
+                </span>
+                <StatusText
+                  label={
+                    latestReport.semanticQAResult.executed
+                      ? `Executed (${latestReport.semanticQAResult.engine ?? 'Gemini'})`
+                      : 'Not Executed'
+                  }
+                  tone={latestReport.semanticQAResult.executed ? 'nominal' : 'muted'}
+                />
+              </div>
+              <p className="leading-relaxed">
+                {latestReport.semanticReviewSummary}
+              </p>
+            </div>
           ) : null}
+        </Surface>
+      ) : null}
+
+      {latestReport?.checksEvaluated && latestReport.checksEvaluated.length > 0 ? (
+        <Surface>
+          <SectionTitle
+            title={`18-Point Production QA Checklist (${latestReport.checksEvaluated.length} Evaluated)`}
+            meta="Each criterion reports measured evidence independently — zero silent skips"
+          />
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+            {latestReport.checksEvaluated.map((chk) => (
+              <div
+                key={chk.id}
+                className="flex items-start justify-between gap-3 p-2.5 rounded-lg border border-slate-200 bg-slate-50/50 text-xs"
+              >
+                <div className="min-w-0">
+                  <p className="font-medium text-slate-900">{chk.label}</p>
+                  <p className="text-[11px] text-slate-500 mt-0.5 break-words">{chk.evidence}</p>
+                </div>
+                <StatusText
+                  label={chk.status.replace('_', ' ')}
+                  tone={
+                    chk.status === 'passed'
+                      ? 'nominal'
+                      : chk.status === 'failed'
+                      ? 'error'
+                      : chk.status === 'warning' || chk.status === 'review_required'
+                      ? 'warning'
+                      : 'muted'
+                  }
+                />
+              </div>
+            ))}
+          </div>
         </Surface>
       ) : null}
 
@@ -305,6 +376,7 @@ export function QualityAssuranceScreen() {
                       </span>{' '}
                       {issue.message}
                     </div>
+                    {renderIssueMeta(issue)}
                     {renderIssueActions(issue)}
                   </li>
                 ))}
@@ -329,6 +401,7 @@ export function QualityAssuranceScreen() {
                       </span>{' '}
                       {issue.message}
                     </div>
+                    {renderIssueMeta(issue)}
                     {renderIssueActions(issue)}
                   </li>
                 ))}
@@ -353,6 +426,7 @@ export function QualityAssuranceScreen() {
                       </span>{' '}
                       {issue.message}
                     </div>
+                    {renderIssueMeta(issue)}
                     {renderIssueActions(issue)}
                   </li>
                 ))}

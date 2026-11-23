@@ -73,8 +73,17 @@ export function ProcessingCenterScreen() {
   const { project, jobs, agentExecutions, checkpoints, logs } = activeBundle;
   const latestJob = jobs[0] ?? null;
 
-  // Build effective status map for all 25 agents from live activePlan or latest persisted job executions
-  const execByAgent = new Map<string, { status: string; outputSummary: string; errorMessage: string | null }>();
+  const execByAgent = new Map<
+    string,
+    {
+      status: string;
+      outputSummary: string;
+      errorMessage: string | null;
+      retryCount: number;
+      lastRetryReason: string | null;
+      executionEngine: string | null;
+    }
+  >();
   if (activePlan && activePlan.projectId === project.id) {
     for (const id of activePlan.topologicalOrder) {
       const t = activePlan.tasks[id];
@@ -82,6 +91,9 @@ export function ProcessingCenterScreen() {
         status: t.status,
         outputSummary: t.outputSummary,
         errorMessage: t.errorMessage,
+        retryCount: t.retryCount ?? 0,
+        lastRetryReason: t.lastRetryReason ?? null,
+        executionEngine: t.executionEngine ?? null,
       });
     }
   } else if (latestJob) {
@@ -90,9 +102,13 @@ export function ProcessingCenterScreen() {
         status: rec.status,
         outputSummary: rec.outputSummary,
         errorMessage: rec.errorMessage,
+        retryCount: rec.retryCount ?? 0,
+        lastRetryReason: rec.lastRetryReason ?? null,
+        executionEngine: rec.executionEngine ?? null,
       });
     }
   }
+  const latestQaCycles = activeBundle.qaReports[0]?.correctionCyclesRun ?? 0;
 
   const completedCount = AGENT_REGISTRY.filter((a) => {
     const st = execByAgent.get(a.id)?.status;
@@ -198,8 +214,8 @@ export function ProcessingCenterScreen() {
             {completedCount} finished · {waitingForModelCount} waiting model
           </p>
           <p className="mt-1 text-xs text-slate-600 tabular-nums">
-            {failedCount} failed · {pendingCount} ready/pending
-            {notIntegratedCount > 0 ? ` · ${notIntegratedCount} unintegrated` : ''}
+            {failedCount} failed · {pendingCount} ready/pending · {latestJob?.retryCount ?? 0} retries ·{' '}
+            {latestQaCycles} QA auto-fix cycle(s)
           </p>
           {waitingForModelCount > 0 ? (
             <button
@@ -211,7 +227,7 @@ export function ProcessingCenterScreen() {
             </button>
           ) : (
             <p className="mt-1 text-xs text-slate-500">
-              Missing models never report fake completion
+              Bounded transient retries + max 2 QA correction cycles
             </p>
           )}
         </div>
@@ -308,6 +324,22 @@ export function ProcessingCenterScreen() {
                       <span className="font-mono">{agent.memoryTier}</span>
                       <span aria-hidden="true">·</span>
                       <span className="tabular-nums">~{agent.estimatedPeakRamMb} MB peak</span>
+                      {runtime?.executionEngine ? (
+                        <>
+                          <span aria-hidden="true">·</span>
+                          <span className="text-slate-700 font-medium truncate max-w-[260px]">
+                            {runtime.executionEngine}
+                          </span>
+                        </>
+                      ) : null}
+                      {runtime && runtime.retryCount > 0 ? (
+                        <>
+                          <span aria-hidden="true">·</span>
+                          <span className="text-amber-700 font-medium tabular-nums">
+                            {runtime.retryCount} retr{runtime.retryCount === 1 ? 'y' : 'ies'}
+                          </span>
+                        </>
+                      ) : null}
                     </div>
                   </button>
                 </li>
@@ -362,6 +394,24 @@ export function ProcessingCenterScreen() {
                   {selectedAgent.recoveryStrategy}
                 </p>
               </div>
+              {execByAgent.get(selectedAgent.id)?.executionEngine ? (
+                <div className="pt-2 border-t border-slate-100">
+                  <p className="font-medium text-slate-500">Active Engine / Fallback</p>
+                  <p className="mt-1 font-mono text-[11px] text-slate-900">
+                    {execByAgent.get(selectedAgent.id)?.executionEngine}
+                  </p>
+                </div>
+              ) : null}
+              {(execByAgent.get(selectedAgent.id)?.retryCount ?? 0) > 0 ? (
+                <div className="pt-2 border-t border-slate-100">
+                  <p className="font-medium text-amber-700">
+                    Transient Retries ({execByAgent.get(selectedAgent.id)?.retryCount})
+                  </p>
+                  <p className="mt-1 text-amber-800">
+                    {execByAgent.get(selectedAgent.id)?.lastRetryReason}
+                  </p>
+                </div>
+              ) : null}
               {execByAgent.get(selectedAgent.id)?.outputSummary ? (
                 <div className="pt-2 border-t border-slate-100">
                   <p className="font-medium text-slate-500">Latest Execution Output</p>

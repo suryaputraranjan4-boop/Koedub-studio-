@@ -2,12 +2,17 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { AGENT_REGISTRY } from '../agents/registry';
 import {
+  classifyErrorRecoverability,
+  computeRetryBackoffMs,
   computeTopologicalOrder,
   createProcessingPlan,
   DEFAULT_8GB_POLICY,
+  determineQACorrectionTargets,
+  invalidateDownstreamTasks,
   resolveEffectiveHeavyConcurrency,
   selectNextEligibleTasks,
   summarizePlanProgress,
+  validateCheckpointPrerequisites,
 } from './scheduler';
 
 test('agent registry defines exactly 25 unique logical agents numbered 1..25', () => {
@@ -104,4 +109,80 @@ test('progress summary never counts not_integrated agents as completed', () => {
   assert.equal(summary.completed, 1);
   assert.equal(summary.notIntegrated, 2);
   assert.equal(summary.percentCompleted, 4);
+});
+
+test('classifyErrorRecoverability distinguishes transient failures from permanent errors and bounds backoff', () => {
+  assert.equal(classifyErrorRecoverability('HTTP 429 rate limit exceeded').recoverable, true);
+  assert.equal(classifyErrorRecoverability('Request timeout after 15000ms').recoverable, true);
+  assert.equal(classifyErrorRecoverability('QuotaExceededError: IndexedDB full').recoverable, false);
+  assert.equal(classifyErrorRecoverability('Corrupt WAV header / invalid format').recoverable, false);
+
+  const b1 = computeRetryBackoffMs(1, 500);
+  const b2 = computeRetryBackoffMs(2, 500);
+  const b5 = computeRetryBackoffMs(5, 500);
+  assert.ok(b2 > b1);
+  assert.ok(b5 <= 8000);
+});
+
+test('invalidateDownstreamTasks resets dependents and validateCheckpointPrerequisites catches missing artifacts', () => {
+  const plan = createProcessingPlan('proj_test', {
+    id: 'ckpt_2',
+    projectId: 'proj_test',
+    jobId: 'job_2',
+    stageAgentId: 'translation',
+    completedAgentIds: [
+      'master_orchestrator',
+      'recovery_resource_manager',
+      'media_analyzer',
+      'speaker_diarization',
+      'japanese_asr',
+      'context_intelligence',
+      'translation',
+      'hindi_tts',
+    ],
+    savedAt: '2026-11-23T00:00:00.000Z',
+    valid: true,
+    notes: '',
+  });
+
+  // Invalidate translation -> downstream hindi_tts must reset from completed to ready/waiting
+  const invalidated = invalidateDownstreamTasks(plan, 'translation');
+  assert.ok(invalidated.includes('hindi_tts'));
+  assert.notEqual(plan.tasks.hindi_tts.status, 'completed');
+  assert.equal(plan.tasks.japanese_asr.status, 'completed');
+
+  // Checkpoint prerequisite validation detects missing persisted segments/audio
+  const missingCheck = validateCheckpointPrerequisites(
+    ['master_orchestrator', 'recovery_resource_manager', 'media_analyzer', 'speaker_diarization', 'japanese_asr', 'hindi_tts'],
+    new Set(['japanese_asr'])
+  );
+  assert.equal(missingCheck.valid, false);
+  assert.equal(missingCheck.earliestInvalidatedAgent, 'japanese_asr');
+  assert.ok(!missingCheck.prunedCompletedIds.includes('japanese_asr'));
+
+  // QA auto-correction maps acoustic & timing defects to responsible downstream agents
+  const targets = determineQACorrectionTargets([
+    {
+      id: 'qa_1',
+      severity: 'warning',
+      category: 'timing',
+      segmentId: 'SEG-1',
+      message: 'Timing shift exceeded preferred 300ms window',
+      responsibleAgent: 'synchronization',
+      resolutionState: 'open',
+      resolved: false,
+    },
+    {
+      id: 'qa_2',
+      severity: 'error',
+      category: 'audio_quality',
+      segmentId: null,
+      message: 'Master mix audio clipping detected above 0 dBFS',
+      responsibleAgent: 'audio_mixing',
+      resolutionState: 'open',
+      resolved: false,
+    },
+  ]);
+  assert.ok(targets.includes('synchronization'));
+  assert.ok(targets.includes('audio_mixing'));
 });

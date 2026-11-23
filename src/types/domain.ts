@@ -193,20 +193,32 @@ export interface VoiceAssignmentHistoryEntry {
   locked: boolean;
 }
 
+export interface CharacterEvidenceEntry {
+  recordedAt: string;
+  source: string;
+  summary: string;
+  confidence: number | null;
+}
+
+export type CloudPrebuiltVoiceName = 'Puck' | 'Charon' | 'Kore' | 'Fenrir' | 'Zephyr';
+
 export interface CharacterProfile {
   characterId: string;
   projectId: string | null; // null allows cross-episode persistent series memory
   seriesScope: string;
   displayName: string;
   visualDescriptors: string[];
+  visualEmbeddingVector?: number[] | null;
   associatedSpeakerIds: string[];
   voiceCharacteristics: VoiceCharacteristics;
   assignedHindiVoiceId: string | null;
+  assignedCloudVoiceName?: CloudPrebuiltVoiceName | null;
   voiceLocked: boolean;
   personality: string;
   speakingStyle: string;
   relationships: CharacterRelationship[];
   dialogueHistoryIds: string[];
+  identityEvidenceHistory?: CharacterEvidenceEntry[];
   firstSeenMs: number | null;
   lastSeenMs: number | null;
   identityConfidence: number; // 0 to 1
@@ -221,6 +233,7 @@ export interface CharacterProfile {
 export interface Speaker {
   id: string;
   projectId: string;
+  internalSpeakerId?: string;
   speakerLabel: string;
   roleType: SpeakerRoleType;
   totalDurationMs: number;
@@ -228,6 +241,9 @@ export interface Speaker {
   estimatedPitchHz: number | null;
   matchedCharacterId: string | null;
   matchConfidence: number;
+  diarizationMethod?: 'pyannote_onnx' | 'acoustic_fallback';
+  overlapCount?: number;
+  isNarratorCandidate?: boolean;
   reviewStatus: ReviewStatus;
 }
 
@@ -236,6 +252,7 @@ export interface CharacterSpeakerAssociation {
   projectId: string;
   characterId: string;
   speakerId: string;
+  internalSpeakerId?: string;
   audioEvidenceScore: number;
   visualEvidenceScore: number;
   mouthSyncEvidenceScore: number;
@@ -254,7 +271,8 @@ export interface VoiceProfile {
   genderStyle: string;
   engineRuntime: string;
   modelId: string;
-  synthesisMode: 'neural_native' | 'single_speaker_dsp_preset';
+  synthesisMode: 'neural_native' | 'cloud_prebuilt_voice' | 'single_speaker_dsp_preset';
+  cloudVoiceName?: CloudPrebuiltVoiceName | null;
   dspPitchSemitones: number;
   dspRateMultiplier: number;
   nativeEmotionControl: boolean;
@@ -331,6 +349,8 @@ export interface CollaborativeTranslationMeta {
   disagreementFlag: boolean;
   geminiConfidence: number | null;
   localConfidence: number | null;
+  confidenceSource?: string;
+  evidence?: string;
   reasoning: string;
   cloudReviewPending: boolean;
   modelUsed: string | null;
@@ -456,6 +476,9 @@ export interface AgentExecutionRecord {
   inputSummary: string;
   outputSummary: string;
   errorMessage: string | null;
+  retryCount?: number;
+  lastRetryReason?: string | null;
+  executionEngine?: string | null;
   checkpointSaved: boolean;
 }
 
@@ -488,6 +511,13 @@ export interface ModelMetadata {
   quantization: string;
   version: string;
   integrityHashSha256: string | null;
+  checksumStatus?:
+    | 'verified_sha256'
+    | 'runtime_only_no_published_checksum'
+    | 'unverified'
+    | 'cache_missing';
+  runtimeVerified?: boolean;
+  runtimeVerifiedAt?: string | null;
   downloadStatus:
     | 'not_downloaded'
     | 'downloading'
@@ -512,6 +542,11 @@ export type SoundEventCategory =
   | 'music'
   | 'song'
   | 'sfx_impact'
+  | 'footsteps'
+  | 'rain'
+  | 'wind'
+  | 'water'
+  | 'birds'
   | 'ambience_nature'
   | 'animal'
   | 'crowd';
@@ -527,9 +562,10 @@ export interface SoundEventRecord {
   label: string;
   spectralCentroidHz: number;
   energyDb: number;
+  classifierSource?: 'heuristic_dsp' | 'neural_model';
 }
 
-export type AudioStemType = 'dialogue_stem' | 'background_stem' | 'final_mix';
+export type AudioStemType = 'dialogue_stem' | 'background_stem' | 'external_me_stem' | 'final_mix';
 
 export interface AudioStemRecord {
   id: string;
@@ -537,10 +573,14 @@ export interface AudioStemRecord {
   stemType: AudioStemType;
   vaultKey: string;
   sampleRate: number;
+  channels?: number;
   durationMs: number;
   sizeBytes: number;
   separationMethod: string;
   confidence: number;
+  residualDialogueLeakageDb?: number | null;
+  artifactRiskScore?: number | null;
+  isExternalCleanStem?: boolean;
   artifactWarning: string | null;
   createdAt: string;
 }
@@ -580,19 +620,33 @@ export interface AudioClip {
   trimEndMs?: number;
 }
 
+export type QAIssueCategory =
+  | 'asr_quality'
+  | 'translation'
+  | 'cultural_nuance'
+  | 'pronunciation'
+  | 'speaker_identity'
+  | 'character_identity'
+  | 'voice'
+  | 'emotion_delivery'
+  | 'timing'
+  | 'audio_quality'
+  | 'leakage'
+  | 'sound_preservation'
+  | 'stereo_integrity';
+
 export interface QAIssue {
   id: string;
   segmentId: string | null;
   clipId?: string | null;
-  category:
-    | 'translation'
-    | 'timing'
-    | 'voice'
-    | 'audio_quality'
-    | 'character_identity'
-    | 'sound_preservation';
+  category: QAIssueCategory;
   severity: 'warning' | 'error' | 'review_required';
   message: string;
+  evidence?: string;
+  responsibleAgent?: string;
+  resolutionState?: 'open' | 'auto_corrected' | 'manual_review_required';
+  retryCount?: number;
+  finalReviewStatus?: ReviewStatus;
   resolved: boolean;
 }
 
@@ -602,8 +656,25 @@ export interface AcousticQAMetrics {
   clippingSampleCount: number;
   silenceRatio: number;
   dialogueToBackgroundDb: number | null;
+  channels?: number;
+  sampleRate?: number;
   exportIntegrityVerified: boolean;
   measuredStemVaultKey: string | null;
+}
+
+export interface QACheckSummaryItem {
+  id: string;
+  label: string;
+  status: 'passed' | 'warning' | 'failed' | 'review_required' | 'skipped';
+  evidence: string;
+}
+
+export interface SemanticQAResult {
+  executed: boolean;
+  engine: string | null;
+  checkedCount: number;
+  findings: string[];
+  executedAt: string | null;
 }
 
 export interface QAReport {
@@ -617,7 +688,11 @@ export interface QAReport {
   failedCount: number;
   reviewRequiredCount: number;
   issues: QAIssue[];
+  checksEvaluated?: QACheckSummaryItem[];
   acousticMetrics?: AcousticQAMetrics | null;
+  semanticQAResult?: SemanticQAResult | null;
+  correctionCyclesRun?: number;
+  residualDialogueLeakageDb?: number | null;
   semanticReviewSummary?: string | null;
   engineNote: string;
 }
@@ -637,9 +712,25 @@ export interface Checkpoint {
   jobId: string;
   stageAgentId: string;
   completedAgentIds: string[];
+  sourceMediaVaultKey?: string | null;
+  requiredModelIds?: string[];
   savedAt: string;
   valid: boolean;
   notes: string;
+}
+
+export interface PipelineArtifactRecord {
+  id: string;
+  projectId: string;
+  artifactType:
+    | 'face_detections'
+    | 'visual_tracks'
+    | 'speaker_turns'
+    | 'chunk_states'
+    | 'retry_history'
+    | 'qa_correction_history';
+  payload: unknown;
+  updatedAt: string;
 }
 
 export interface ProcessingLog {
@@ -669,7 +760,9 @@ export interface GeminiConnectionStatus {
   primaryModel: string;
   ttsModel: string;
   availableModels: string[];
+  availableTextModels?: string[];
   availableTtsModels: string[];
+  modelDiscoverySource?: string;
   usage: GeminiSessionUsage;
   message: string;
 }
@@ -713,6 +806,7 @@ export interface ResourceSnapshot {
   activeModelMemoryMb: number;
   maxHeavyConcurrency: 1 | 2;
   storage: StorageUsageBreakdown;
+  storagePersisted?: boolean | null;
   batteryLevelPercent: number | null;
   batteryCharging: boolean | null;
   batterySupported: boolean;

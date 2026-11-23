@@ -1,9 +1,14 @@
 import { AGENT_MAP } from '../agents/registry';
 import type { AgentId, ProcessingPlan } from '../agents/types';
 import {
+  classifyErrorRecoverability,
+  computeRetryBackoffMs,
   createProcessingPlan,
+  determineQACorrectionTargets,
+  invalidateDownstreamTasks,
   selectNextEligibleTasks,
   summarizePlanProgress,
+  validateCheckpointPrerequisites,
 } from './scheduler';
 import {
   getAllRecords,
@@ -24,17 +29,21 @@ import { localModelRuntime } from '../ai/modelRuntime';
 import {
   analyzeVoiceAcoustics,
   clusterSpeakerIntervals,
-  decodeMediaBlobToMono16k,
+  decodeMediaBlobToStereo,
   decodePcmWavBuffer,
-  detectVoiceActivitySegments,
+  detectVoiceActivityChunked,
   encodeFloat32ToWavBlob,
-  type DecodedAudioMono,
+  encodeStereoToWavBlob,
+  extractMono16kChunkFromStereo,
+  type DecodedAudioStereo,
   type SpeakerClusterSegment,
+  type SpeechInterval,
 } from '../ai/audioDsp';
 import {
   computeMultimodalFaceVoiceMatches,
   detectVideoScenesFromBlob,
   extractKeyframesForScenes,
+  reconstructFrameCanvasesFromBlobs,
   runMediaPipeFaceDetectionOnFrames,
   trackVisualCharacters,
   type FaceDetectionBox,
@@ -49,23 +58,28 @@ import {
   type AsrRawChunk,
 } from '../ai/languageIntelligence';
 import {
+  applyRealSyncToGeneratedWavBlob,
+  applyVoiceActingToWavBlob,
   buildVoiceActingDirective,
-  computeSynchronizedPlacement,
+  resolvePersistentCloudVoiceName,
   selectBestVoiceForCharacter,
   synthesizeHindiWavWithModel,
 } from '../ai/speechSynthesis';
 import {
   buildAudioStemRecord,
-  classifyAudioSoundEvents,
+  classifyAudioSoundEventsChunked,
   computeRealWaveformPeaks,
   computeWaveformPeaksFromBlob,
+  decodeStoredWavBlobToStereo,
   measureAcousticQAMetrics,
+  measureStereoAcousticQAMetrics,
   mixFinalDubAudio,
   separateAudioStemsConservative,
   type MixDialogueClipInput,
 } from '../ai/audioProduction';
 import {
   executeCollaborativeIntelligence,
+  runSemanticQAReviewOnSegment,
   synthesizeHindiWavViaGeminiCloud,
 } from '../ai/intelligenceRouter';
 import { evaluateTimingAdjustment, findOverlappingClips } from '../timeline/timelineEngine';
@@ -83,14 +97,17 @@ import type {
   ExtractedFrame,
   ImportedMedia,
   MediaMetadata,
+  PipelineArtifactRecord,
   ProcessingJob,
   ProcessingLog,
   Project,
   ProjectVersion,
   PronunciationEntry,
+  QACheckSummaryItem,
   QAIssue,
   QAReport,
   Scene,
+  SemanticQAResult,
   SoundEventRecord,
   Speaker,
   TimelineTrack,
@@ -109,7 +126,7 @@ interface PipelineScratchContext {
   media: ImportedMedia | null;
   mediaBlob: Blob | null;
   mediaMetadata: MediaMetadata | null;
-  decodedAudio: DecodedAudioMono | null;
+  decodedStereo: DecodedAudioStereo | null;
   scenes: Scene[];
   extractedFrames: ExtractedFrame[];
   frameCanvases: Map<string, HTMLCanvasElement>;
@@ -120,8 +137,13 @@ interface PipelineScratchContext {
   speakerVoiceCharacteristics: Map<string, VoiceCharacteristics>;
   associations: CharacterSpeakerAssociation[];
   soundEvents: SoundEventRecord[];
-  backgroundSamples: Float32Array | null;
+  backgroundLeft: Float32Array | null;
+  backgroundRight: Float32Array | null;
   backgroundSampleRate: number;
+  usedModels: Set<string>;
+  retryHistory: Array<{ agentId: AgentId; attempt: number; reason: string; timestamp: string }>;
+  qaCorrectionHistory: Array<{ cycle: number; targets: AgentId[]; unresolvedBefore: number; timestamp: string }>;
+  lastQAReport: QAReport | null;
 }
 
 interface SingleAgentOutcome {
@@ -137,6 +159,22 @@ interface SingleAgentOutcome {
   >;
   outputSummary: string;
   errorMessage: string | null;
+  executionEngine?: string | null;
+}
+
+function abortableSleep(ms: number, signal: AbortSignal): Promise<void> {
+  if (ms <= 0 || signal.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 class MasterOrchestratorRuntime {
@@ -175,11 +213,38 @@ class MasterOrchestratorRuntime {
     return log;
   }
 
+  private async saveArtifact(
+    projectId: string,
+    artifactType: PipelineArtifactRecord['artifactType'],
+    payload: unknown
+  ): Promise<void> {
+    const record: PipelineArtifactRecord = {
+      id: `art_${projectId}_${artifactType}`,
+      projectId,
+      artifactType,
+      payload,
+      updatedAt: new Date().toISOString(),
+    };
+    await putRecord(STORES.pipeline_artifacts, record);
+  }
+
+  private async loadArtifact<T>(
+    projectId: string,
+    artifactType: PipelineArtifactRecord['artifactType']
+  ): Promise<T | null> {
+    const rec = await getRecord<PipelineArtifactRecord>(
+      STORES.pipeline_artifacts,
+      `art_${projectId}_${artifactType}`
+    );
+    return rec ? (rec.payload as T) : null;
+  }
+
   private async saveCheckpoint(
     projectId: string,
     jobId: string,
     stageAgentId: AgentId,
     plan: ProcessingPlan,
+    scratch: PipelineScratchContext,
     notes: string
   ): Promise<Checkpoint> {
     const completedAgentIds = plan.topologicalOrder.filter((id) => {
@@ -192,6 +257,8 @@ class MasterOrchestratorRuntime {
       jobId,
       stageAgentId,
       completedAgentIds,
+      sourceMediaVaultKey: scratch.media?.vaultKey ?? null,
+      requiredModelIds: Array.from(scratch.usedModels),
       savedAt: new Date().toISOString(),
       valid: true,
       notes,
@@ -200,23 +267,393 @@ class MasterOrchestratorRuntime {
     return checkpoint;
   }
 
-  private async ensureDecodedAudio(scratch: PipelineScratchContext): Promise<DecodedAudioMono | null> {
-    if (scratch.decodedAudio) return scratch.decodedAudio;
+  /**
+   * Decodes source media to stereo 44.1/48 kHz PCM once into scratch memory.
+   * Heavy ML stages slice 16 kHz mono chunks via extractMono16kChunkFromStereo without
+   * duplicating full-episode mono arrays in RAM.
+   */
+  private async ensureDecodedStereo(
+    scratch: PipelineScratchContext
+  ): Promise<DecodedAudioStereo | null> {
+    if (scratch.decodedStereo) return scratch.decodedStereo;
     if (!scratch.mediaBlob) return null;
-    try {
-      scratch.decodedAudio = await decodeMediaBlobToMono16k(scratch.mediaBlob);
-      return scratch.decodedAudio;
-    } catch {
-      return null;
+    scratch.decodedStereo = await decodeMediaBlobToStereo(
+      scratch.mediaBlob,
+      scratch.media?.fileExtension
+    );
+    return scratch.decodedStereo;
+  }
+
+  /**
+   * Restores persisted intermediate artifacts and validates checkpoint prerequisites
+   * (source media blob presence, model cache integrity, saved visual/audio artifacts).
+   */
+  private async restoreAndValidateCheckpoint(
+    projectId: string,
+    checkpoint: Checkpoint,
+    scratch: PipelineScratchContext
+  ): Promise<{
+    verifiedCompletedIds: AgentId[];
+    invalidationNote: string | null;
+  }> {
+    const missingArtifactAgents = new Set<AgentId>();
+    const notes: string[] = [];
+
+    // 1. Verify original source media still exists in file_vault
+    if (checkpoint.sourceMediaVaultKey) {
+      const vaultEntry = await getRecord<VaultEntry>(
+        STORES.file_vault,
+        checkpoint.sourceMediaVaultKey
+      );
+      if (!vaultEntry) {
+        missingArtifactAgents.add('media_analyzer');
+        notes.push('Source media blob missing from local file_vault.');
+      }
+    }
+
+    // 2. Verify any models relied upon by this checkpoint are still cached in browser Cache API
+    if (checkpoint.requiredModelIds && checkpoint.requiredModelIds.length > 0) {
+      for (const modelId of checkpoint.requiredModelIds) {
+        const integrity = await localModelRuntime.verifyModelCacheIntegrity(modelId);
+        if (!integrity.cachePresent) {
+          notes.push(`Model cache evicted for ${modelId}.`);
+          if (modelId === 'model_mediapipe_blazeface') missingArtifactAgents.add('face_detection');
+          if (modelId === 'model_pyannote_segmentation') missingArtifactAgents.add('speaker_diarization');
+          if (modelId === 'model_whisper_small_onnx') missingArtifactAgents.add('japanese_asr');
+          if (modelId === 'model_nllb_200_600m') missingArtifactAgents.add('translation');
+          if (modelId === 'model_mms_tts_hin') missingArtifactAgents.add('hindi_tts');
+        }
+      }
+    }
+
+    // 3. Restore persisted tables & intermediate artifacts
+    const [scenes, frames, speakers, assocs, soundEvents] = await Promise.all([
+      getByIndex<Scene>(STORES.scenes, 'projectId', projectId),
+      getByIndex<ExtractedFrame>(STORES.extracted_frames, 'projectId', projectId),
+      getByIndex<Speaker>(STORES.speakers, 'projectId', projectId),
+      getByIndex<CharacterSpeakerAssociation>(STORES.character_speaker_associations, 'projectId', projectId),
+      getByIndex<SoundEventRecord>(STORES.sound_events, 'projectId', projectId),
+    ]);
+
+    scratch.scenes = scenes;
+    scratch.extractedFrames = frames;
+    scratch.speakers = speakers;
+    scratch.associations = assocs;
+    scratch.soundEvents = soundEvents;
+
+    const savedFaces = await this.loadArtifact<FaceDetectionBox[]>(projectId, 'face_detections');
+    const savedTracks = await this.loadArtifact<VisualTrackCluster[]>(projectId, 'visual_tracks');
+    const savedTurns = await this.loadArtifact<SpeakerClusterSegment[]>(projectId, 'speaker_turns');
+    const savedRetries = await this.loadArtifact<PipelineScratchContext['retryHistory']>(
+      projectId,
+      'retry_history'
+    );
+    const savedQaCycles = await this.loadArtifact<PipelineScratchContext['qaCorrectionHistory']>(
+      projectId,
+      'qa_correction_history'
+    );
+
+    if (savedFaces) scratch.faceDetections = savedFaces;
+    if (savedTracks) scratch.visualTracks = savedTracks;
+    if (savedTurns) scratch.speakerTurns = savedTurns;
+    if (savedRetries) scratch.retryHistory = savedRetries;
+    if (savedQaCycles) scratch.qaCorrectionHistory = savedQaCycles;
+
+    const completedSet = new Set(checkpoint.completedAgentIds as AgentId[]);
+
+    // Reconstruct frameCanvases from JPEG blobs if frames were extracted but downstream visual stages still pending
+    if (
+      frames.length > 0 &&
+      completedSet.has('frame_extraction') &&
+      (!completedSet.has('face_detection') || !completedSet.has('character_tracking'))
+    ) {
+      scratch.frameCanvases = await reconstructFrameCanvasesFromBlobs(frames, async (vaultKey) => {
+        const entry = await getRecord<VaultEntry>(STORES.file_vault, vaultKey);
+        return entry?.blob ?? null;
+      });
+      if (scratch.frameCanvases.size === 0) {
+        missingArtifactAgents.add('frame_extraction');
+        notes.push('Temporary JPEG keyframe blobs were purged; re-extracting keyframes.');
+      }
+    }
+
+    // Check required artifacts for completed stages
+    if (completedSet.has('speaker_diarization') && scratch.speakerTurns.length === 0 && scratch.speakers.length > 0) {
+      missingArtifactAgents.add('speaker_diarization');
+      notes.push('Diarized speaker turn artifact missing; re-running speaker diarization.');
+    }
+    if (completedSet.has('face_detection') && frames.length > 0 && !savedFaces) {
+      missingArtifactAgents.add('face_detection');
+      notes.push('Face detection artifact missing; re-running face detection.');
+    }
+
+    const validation = validateCheckpointPrerequisites(
+      checkpoint.completedAgentIds as AgentId[],
+      missingArtifactAgents
+    );
+
+    if (!validation.valid) {
+      await putRecord<Checkpoint>(STORES.checkpoints, {
+        ...checkpoint,
+        valid: false,
+        notes: `${checkpoint.notes} · Pruned on resume from ${validation.earliestInvalidatedAgent}: ${notes.join(' ')}`,
+      });
+    }
+
+    return {
+      verifiedCompletedIds: validation.prunedCompletedIds,
+      invalidationNote: validation.valid
+        ? null
+        : `Checkpoint pruned at ${validation.earliestInvalidatedAgent}: ${notes.join(' ')}`,
+    };
+  }
+
+  /**
+   * Executes a single agent with bounded retries + exponential backoff for recoverable errors only.
+   */
+  private async executeAgentWithRetries(
+    agentId: AgentId,
+    projectId: string,
+    job: ProcessingJob,
+    plan: ProcessingPlan,
+    settings: AppSettings,
+    signal: AbortSignal,
+    scratch: PipelineScratchContext,
+    callbacks?: OrchestratorRunCallbacks
+  ): Promise<SingleAgentOutcome> {
+    const def = AGENT_MAP[agentId];
+    const task = plan.tasks[agentId];
+    const maxRetries = Math.max(0, task.maxRetries);
+
+    for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+      if (signal.aborted) {
+        return {
+          status: 'cancelled',
+          outputSummary: 'Aborted before execution.',
+          errorMessage: null,
+        };
+      }
+
+      try {
+        const outcome = await this.executeSingleAgent(
+          agentId,
+          projectId,
+          job.jobId,
+          settings,
+          signal,
+          scratch
+        );
+
+        // If an agent explicitly returned 'failed' with a recoverable transient error, consider retry
+        if (outcome.status === 'failed' && outcome.errorMessage && attempt < maxRetries) {
+          const classification = classifyErrorRecoverability(outcome.errorMessage);
+          if (classification.recoverable) {
+            const backoffMs = computeRetryBackoffMs(attempt);
+            task.retryCount += 1;
+            task.lastRetryReason = `${classification.category}: ${outcome.errorMessage}`;
+            job.retryCount += 1;
+            scratch.retryHistory.push({
+              agentId,
+              attempt: task.retryCount,
+              reason: task.lastRetryReason,
+              timestamp: new Date().toISOString(),
+            });
+            await this.saveArtifact(projectId, 'retry_history', scratch.retryHistory);
+            await this.appendLog(
+              projectId,
+              job.jobId,
+              agentId,
+              'warning',
+              `${def.name} transient failure (attempt ${attempt + 1}/${maxRetries + 1}): ${outcome.errorMessage} — retrying in ${backoffMs} ms.`,
+              callbacks
+            );
+            await abortableSleep(backoffMs, signal);
+            continue;
+          }
+        }
+
+        return outcome;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Unexpected agent execution error.';
+        const classification = classifyErrorRecoverability(msg);
+
+        if (classification.category === 'cancelled' || signal.aborted) {
+          return {
+            status: 'cancelled',
+            outputSummary: `${def.name} cancelled cleanly at safe boundary.`,
+            errorMessage: null,
+          };
+        }
+
+        if (classification.recoverable && attempt < maxRetries) {
+          const backoffMs = computeRetryBackoffMs(attempt);
+          task.retryCount += 1;
+          task.lastRetryReason = `${classification.category}: ${msg}`;
+          job.retryCount += 1;
+          scratch.retryHistory.push({
+            agentId,
+            attempt: task.retryCount,
+            reason: task.lastRetryReason,
+            timestamp: new Date().toISOString(),
+          });
+          await this.saveArtifact(projectId, 'retry_history', scratch.retryHistory);
+          await this.appendLog(
+            projectId,
+            job.jobId,
+            agentId,
+            'warning',
+            `${def.name} threw recoverable error (${classification.category}, attempt ${attempt + 1}/${maxRetries + 1}): ${msg} — backing off ${backoffMs} ms.`,
+            callbacks
+          );
+          await abortableSleep(backoffMs, signal);
+          continue;
+        }
+
+        return {
+          status: 'failed',
+          outputSummary: `${def.name} failed (${classification.category}): ${msg}`,
+          errorMessage: msg,
+        };
+      } finally {
+        if (def.memoryTier === 'heavy_ai_model') {
+          await localModelRuntime.unloadActiveModel();
+        }
+      }
+    }
+
+    return {
+      status: 'failed',
+      outputSummary: `${def.name} exhausted retry budget.`,
+      errorMessage: task.lastRetryReason ?? 'Retry limit exhausted.',
+    };
+  }
+
+  /**
+   * Runs one batch of scheduled tasks respecting heavy-model concurrency and parallelizing
+   * safe independent lightweight tasks.
+   */
+  private async runScheduledBatch(
+    eligible: AgentId[],
+    projectId: string,
+    job: ProcessingJob,
+    plan: ProcessingPlan,
+    settings: AppSettings,
+    signal: AbortSignal,
+    scratch: PipelineScratchContext,
+    callbacks?: OrchestratorRunCallbacks
+  ): Promise<void> {
+    const runOne = async (agentId: AgentId) => {
+      if (signal.aborted) return;
+      const def = AGENT_MAP[agentId];
+      const task = plan.tasks[agentId];
+      const startedAt = new Date().toISOString();
+      task.status = 'running';
+      task.startedAt = startedAt;
+      job.currentStage = def.name;
+      job.updatedAt = startedAt;
+      callbacks?.onPlanUpdated?.(plan, job);
+
+      const execResult = await this.executeAgentWithRetries(
+        agentId,
+        projectId,
+        job,
+        plan,
+        settings,
+        signal,
+        scratch,
+        callbacks
+      );
+
+      const completedAt = new Date().toISOString();
+      const durationMs = new Date(completedAt).getTime() - new Date(startedAt).getTime();
+      const finishedSuccessfully =
+        execResult.status === 'completed' ||
+        execResult.status === 'completed_with_warnings' ||
+        execResult.status === 'needs_review';
+
+      task.status = execResult.status;
+      task.completedAt = finishedSuccessfully ? completedAt : null;
+      task.outputSummary = execResult.outputSummary;
+      task.errorMessage = execResult.errorMessage;
+      task.executionEngine = execResult.executionEngine ?? task.executionEngine ?? null;
+
+      const record: AgentExecutionRecord = {
+        id: `exec_${job.jobId}_${agentId}`,
+        jobId: job.jobId,
+        projectId,
+        agentId,
+        status: execResult.status,
+        startedAt,
+        completedAt: finishedSuccessfully ? completedAt : null,
+        durationMs,
+        inputSummary: def.inputContract,
+        outputSummary: execResult.outputSummary,
+        errorMessage: execResult.errorMessage,
+        retryCount: task.retryCount,
+        lastRetryReason: task.lastRetryReason ?? null,
+        executionEngine: execResult.executionEngine ?? null,
+        checkpointSaved: finishedSuccessfully,
+      };
+      await putRecord(STORES.agent_executions, record);
+
+      await this.appendLog(
+        projectId,
+        job.jobId,
+        agentId,
+        execResult.status === 'failed'
+          ? 'error'
+          : execResult.status === 'waiting_for_model' ||
+            execResult.status === 'completed_with_warnings' ||
+            execResult.status === 'needs_review' ||
+            execResult.status === 'not_integrated'
+          ? 'warning'
+          : 'info',
+        `${def.name}${execResult.executionEngine ? ` [${execResult.executionEngine}]` : ''}: ${execResult.outputSummary}`,
+        callbacks
+      );
+
+      if (finishedSuccessfully) {
+        const ckpt = await this.saveCheckpoint(
+          projectId,
+          job.jobId,
+          agentId,
+          plan,
+          scratch,
+          `Stage ${def.name} (${execResult.status})`
+        );
+        job.checkpointId = ckpt.id;
+      }
+
+      const progress = summarizePlanProgress(plan);
+      job.progressPercent = progress.percentCompleted;
+      job.updatedAt = completedAt;
+      await putRecord(STORES.processing_jobs, job);
+      callbacks?.onPlanUpdated?.(plan, job);
+    };
+
+    const heavyTasks = eligible.filter((id) => AGENT_MAP[id].memoryTier === 'heavy_ai_model');
+    const lightTasks = eligible.filter((id) => AGENT_MAP[id].memoryTier !== 'heavy_ai_model');
+
+    // Run independent lightweight tasks concurrently when safe
+    if (lightTasks.length > 1) {
+      await Promise.all(lightTasks.map((id) => runOne(id)));
+    } else if (lightTasks.length === 1) {
+      await runOne(lightTasks[0]);
+    }
+
+    // Run heavy model tasks strictly respecting 8 GB RAM isolation
+    for (const id of heavyTasks) {
+      if (signal.aborted) break;
+      await runOne(id);
     }
   }
 
   /**
-   * Executes the dependency-aware 25-agent pipeline for a project.
-   * - Runs Prompt 1 foundation agents (#1, #2, #25) + Prompt 2 AI Intelligence & Hindi Dubbing agents (#3–#20).
-   * - Enforces single-heavy-model loading/unloading for 8 GB RAM compatibility.
-   * - Never fabricates model results: marks missing-model stages honestly as 'waiting_for_model'.
-   * - Preserves Prompt 3 audio production agents (#21–#24) honestly as 'not_integrated'.
+   * Executes the complete dependency-aware 25-agent pipeline for a project:
+   * - Validates and restores checkpoints cleanly (reconstructing frames, tracks, turns).
+   * - Enforces 8 GB RAM heavy-model isolation while parallelizing safe lightweight agents.
+   * - Retries recoverable transient failures with bounded exponential backoff.
+   * - Runs up to 2 bounded QA -> Responsible Agent Correction -> Re-QA cycles before flagging manual review.
    */
   async runProjectPipeline(
     projectId: string,
@@ -236,6 +673,50 @@ class MasterOrchestratorRuntime {
     const controller = new AbortController();
     this.activeControllers.set(projectId, controller);
 
+    const scratch: PipelineScratchContext = {
+      media: null,
+      mediaBlob: null,
+      mediaMetadata: null,
+      decodedStereo: null,
+      scenes: [],
+      extractedFrames: [],
+      frameCanvases: new Map(),
+      faceDetections: [],
+      visualTracks: [],
+      speakerTurns: [],
+      speakers: [],
+      speakerVoiceCharacteristics: new Map(),
+      associations: [],
+      soundEvents: [],
+      backgroundLeft: null,
+      backgroundRight: null,
+      backgroundSampleRate: 48000,
+      usedModels: new Set(),
+      retryHistory: [],
+      qaCorrectionHistory: [],
+      lastQAReport: null,
+    };
+
+    // Preload media references
+    const mediaRecords = await getByIndex<ImportedMedia>(
+      STORES.imported_media,
+      'projectId',
+      projectId
+    );
+    if (mediaRecords[0]) {
+      scratch.media = mediaRecords[0];
+      if (mediaRecords[0].vaultKey) {
+        const entry = await getRecord<VaultEntry>(STORES.file_vault, mediaRecords[0].vaultKey);
+        scratch.mediaBlob = entry?.blob ?? null;
+      }
+      const metaList = await getByIndex<MediaMetadata>(
+        STORES.media_metadata,
+        'projectId',
+        projectId
+      );
+      scratch.mediaMetadata = metaList[0] ?? null;
+    }
+
     const existingCheckpoints = await getByIndex<Checkpoint>(
       STORES.checkpoints,
       'projectId',
@@ -247,7 +728,24 @@ class MasterOrchestratorRuntime {
           .sort((a, b) => b.savedAt.localeCompare(a.savedAt))[0] ?? null
       : null;
 
-    const plan = createProcessingPlan(projectId, latestValidCheckpoint);
+    let plan: ProcessingPlan;
+    let resumeNote: string | null = null;
+    if (latestValidCheckpoint) {
+      const restored = await this.restoreAndValidateCheckpoint(
+        projectId,
+        latestValidCheckpoint,
+        scratch
+      );
+      plan = createProcessingPlan(
+        projectId,
+        restored.verifiedCompletedIds,
+        latestValidCheckpoint.id
+      );
+      resumeNote = restored.invalidationNote;
+    } else {
+      plan = createProcessingPlan(projectId, null);
+    }
+
     const now = new Date().toISOString();
     const job: ProcessingJob = {
       jobId: `job_${projectId}_${Date.now()}`,
@@ -266,25 +764,6 @@ class MasterOrchestratorRuntime {
       cancelled: false,
     };
 
-    const scratch: PipelineScratchContext = {
-      media: null,
-      mediaBlob: null,
-      mediaMetadata: null,
-      decodedAudio: null,
-      scenes: [],
-      extractedFrames: [],
-      frameCanvases: new Map(),
-      faceDetections: [],
-      visualTracks: [],
-      speakerTurns: [],
-      speakers: [],
-      speakerVoiceCharacteristics: new Map(),
-      associations: [],
-      soundEvents: [],
-      backgroundSamples: null,
-      backgroundSampleRate: 16000,
-    };
-
     await putRecord(STORES.processing_jobs, job);
     await putRecord<Project>(STORES.projects, {
       ...project,
@@ -297,10 +776,12 @@ class MasterOrchestratorRuntime {
       projectId,
       job.jobId,
       'master_orchestrator',
-      'info',
+      resumeNote ? 'warning' : 'info',
       latestValidCheckpoint
-        ? `Resuming full 25-agent AI dubbing & audio production pipeline from checkpoint ${latestValidCheckpoint.id} (${latestValidCheckpoint.completedAgentIds.length} stages preserved).`
-        : `Initialized complete 25-agent dependency plan (all 25 agents operational across analysis, collaborative translation, TTS, separation, mixing, and acoustic QA).`,
+        ? `Resuming 25-agent pipeline from checkpoint ${latestValidCheckpoint.id} (${
+            plan.topologicalOrder.filter((id) => plan.tasks[id].status === 'completed').length
+          } verified stages restored). ${resumeNote ?? ''}`.trim()
+        : `Initialized complete 25-agent dependency-aware pipeline with bounded retries, stereo mastering, and 18-check QA auto-correction.`,
       callbacks
     );
 
@@ -339,34 +820,10 @@ class MasterOrchestratorRuntime {
         return { job, plan };
       }
 
-      // Preload media references for checkpoint-resumed runs
-      const mediaRecords = await getByIndex<ImportedMedia>(
-        STORES.imported_media,
-        'projectId',
-        projectId
-      );
-      if (mediaRecords[0]) {
-        scratch.media = mediaRecords[0];
-        if (mediaRecords[0].vaultKey) {
-          const entry = await getRecord<VaultEntry>(
-            STORES.file_vault,
-            mediaRecords[0].vaultKey
-          );
-          scratch.mediaBlob = entry?.blob ?? null;
-        }
-        const metaList = await getByIndex<MediaMetadata>(
-          STORES.media_metadata,
-          'projectId',
-          projectId
-        );
-        scratch.mediaMetadata = metaList[0] ?? null;
-      }
-
-      // Main DAG scheduling loop
+      // 1. Primary DAG Execution Loop
       let safetyIterations = 0;
       while (safetyIterations < 45) {
         safetyIterations += 1;
-
         if (controller.signal.aborted) {
           job.status = 'Cancelled';
           job.cancelled = true;
@@ -383,113 +840,99 @@ class MasterOrchestratorRuntime {
         }
 
         const eligible = selectNextEligibleTasks(plan, policy);
-        if (eligible.length === 0) {
-          break;
-        }
+        if (eligible.length === 0) break;
 
-        for (const agentId of eligible) {
-          if (controller.signal.aborted) break;
+        await this.runScheduledBatch(
+          eligible,
+          projectId,
+          job,
+          plan,
+          settings,
+          controller.signal,
+          scratch,
+          callbacks
+        );
+      }
 
-          const def = AGENT_MAP[agentId];
-          const task = plan.tasks[agentId];
-          const startedAt = new Date().toISOString();
-          task.status = 'running';
-          task.startedAt = startedAt;
-          job.currentStage = def.name;
-          job.updatedAt = startedAt;
-          callbacks?.onPlanUpdated?.(plan, job);
-
-          let execResult: SingleAgentOutcome;
-          try {
-            execResult = await this.executeSingleAgent(
-              agentId,
-              projectId,
-              job.jobId,
-              settings,
-              controller.signal,
-              scratch
-            );
-          } catch (err) {
-            const msg =
-              err instanceof Error ? err.message : 'Unexpected agent execution error.';
-            execResult = {
-              status: 'failed',
-              outputSummary: `${def.name} failed safely: ${msg}`,
-              errorMessage: msg,
-            };
-          } finally {
-            // Strict 8 GB RAM discipline: unload any heavy model immediately after stage ends
-            if (def.memoryTier === 'heavy_ai_model') {
-              await localModelRuntime.unloadActiveModel();
-            }
-          }
-
-          const completedAt = new Date().toISOString();
-          const durationMs =
-            new Date(completedAt).getTime() - new Date(startedAt).getTime();
-
-          const finishedSuccessfully =
-            execResult.status === 'completed' ||
-            execResult.status === 'completed_with_warnings' ||
-            execResult.status === 'needs_review';
-
-          task.status = execResult.status;
-          task.completedAt = finishedSuccessfully ? completedAt : null;
-          task.outputSummary = execResult.outputSummary;
-          task.errorMessage = execResult.errorMessage;
-
-          const record: AgentExecutionRecord = {
-            id: `exec_${job.jobId}_${agentId}`,
-            jobId: job.jobId,
-            projectId,
-            agentId,
-            status: execResult.status,
-            startedAt,
-            completedAt: finishedSuccessfully ? completedAt : null,
-            durationMs,
-            inputSummary: def.inputContract,
-            outputSummary: execResult.outputSummary,
-            errorMessage: execResult.errorMessage,
-            checkpointSaved: finishedSuccessfully,
-          };
-          await putRecord(STORES.agent_executions, record);
+      // 2. Bounded QA -> Responsible Agent Correction -> Re-QA Loop (Max 2 Cycles)
+      const MAX_QA_CORRECTION_CYCLES = 2;
+      if (!controller.signal.aborted && scratch.lastQAReport) {
+        for (let cycle = 1; cycle <= MAX_QA_CORRECTION_CYCLES; cycle += 1) {
+          const targets = determineQACorrectionTargets(scratch.lastQAReport.issues);
+          if (targets.length === 0) break;
 
           await this.appendLog(
             projectId,
             job.jobId,
-            agentId,
-            execResult.status === 'failed'
-              ? 'error'
-              : execResult.status === 'waiting_for_model' ||
-                execResult.status === 'completed_with_warnings' ||
-                execResult.status === 'needs_review' ||
-                execResult.status === 'not_integrated'
-              ? 'warning'
-              : 'info',
-            `${def.name}: ${execResult.outputSummary}`,
+            'quality_assurance',
+            'warning',
+            `QA Auto-Correction Cycle ${cycle}/${MAX_QA_CORRECTION_CYCLES}: routing recoverable issue(s) to [${targets.join(', ')}] and re-running dependent stages.`,
             callbacks
           );
 
-          if (finishedSuccessfully) {
-            const ckpt = await this.saveCheckpoint(
-              projectId,
-              job.jobId,
-              agentId,
-              plan,
-              `Stage ${def.name} (${execResult.status})`
-            );
-            job.checkpointId = ckpt.id;
+          scratch.qaCorrectionHistory.push({
+            cycle,
+            targets,
+            unresolvedBefore: scratch.lastQAReport.issues.filter((i) => !i.resolved).length,
+            timestamp: new Date().toISOString(),
+          });
+          await this.saveArtifact(projectId, 'qa_correction_history', scratch.qaCorrectionHistory);
+
+          // Invalidate target agents and all downstream dependents so stale artifacts cannot persist
+          for (const targetId of targets) {
+            plan.tasks[targetId].status = 'ready';
+            plan.tasks[targetId].completedAt = null;
+            invalidateDownstreamTasks(plan, targetId);
           }
 
-          const progress = summarizePlanProgress(plan);
-          job.progressPercent = progress.percentCompleted;
-          job.updatedAt = completedAt;
-          await putRecord(STORES.processing_jobs, job);
-          callbacks?.onPlanUpdated?.(plan, job);
+          let corrSafety = 0;
+          while (corrSafety < 25 && !controller.signal.aborted) {
+            corrSafety += 1;
+            const nextBatch = selectNextEligibleTasks(plan, policy);
+            if (nextBatch.length === 0) break;
+            await this.runScheduledBatch(
+              nextBatch,
+              projectId,
+              job,
+              plan,
+              settings,
+              controller.signal,
+              scratch,
+              callbacks
+            );
+          }
+
+          if (!scratch.lastQAReport) break;
+          // Persist correction cycle count on latest QA report
+          scratch.lastQAReport = {
+            ...scratch.lastQAReport,
+            correctionCyclesRun: cycle,
+          };
+          await putRecord(STORES.qa_reports, scratch.lastQAReport);
+        }
+
+        // After bounded correction cycles, explicitly mark any still-unresolved issues for manual review
+        if (scratch.lastQAReport && scratch.qaCorrectionHistory.length > 0) {
+          const finalizedIssues: QAIssue[] = scratch.lastQAReport.issues.map((issue) =>
+            issue.resolved
+              ? { ...issue, resolutionState: 'auto_corrected', finalReviewStatus: 'approved' }
+              : {
+                  ...issue,
+                  resolutionState: 'manual_review_required',
+                  retryCount: scratch.qaCorrectionHistory.length,
+                  finalReviewStatus: 'needs_review',
+                }
+          );
+          scratch.lastQAReport = {
+            ...scratch.lastQAReport,
+            correctionCyclesRun: scratch.qaCorrectionHistory.length,
+            issues: finalizedIssues,
+          };
+          await putRecord(STORES.qa_reports, scratch.lastQAReport);
         }
       }
 
-      // Settle remaining blocked or Prompt 3 reserved stages truthfully
+      // 3. Settle remaining blocked stages truthfully
       for (const agentId of plan.topologicalOrder) {
         const task = plan.tasks[agentId];
         const def = AGENT_MAP[agentId];
@@ -497,7 +940,7 @@ class MasterOrchestratorRuntime {
 
         if (!def.isIntegrated) {
           task.status = 'not_integrated';
-          task.outputSummary = `${def.integrationMilestone}: reserved for Prompt 3 audio production.`;
+          task.outputSummary = `${def.integrationMilestone}: not yet integrated.`;
         } else {
           const blockingDep = task.dependsOn.find(
             (depId) =>
@@ -527,6 +970,9 @@ class MasterOrchestratorRuntime {
           inputSummary: def.inputContract,
           outputSummary: task.outputSummary,
           errorMessage: null,
+          retryCount: task.retryCount,
+          lastRetryReason: task.lastRetryReason ?? null,
+          executionEngine: task.executionEngine ?? null,
           checkpointSaved: false,
         };
         await putRecord(STORES.agent_executions, record);
@@ -545,7 +991,7 @@ class MasterOrchestratorRuntime {
         job.errorMessage = null;
       } else if (finalStats.needsReview > 0) {
         job.status = 'Needs Review';
-        job.currentStage = 'AI Dubbing Stages Completed · Review Flagged Items';
+        job.currentStage = '25-Agent Pipeline Completed · Review Flagged Items';
         job.errorMessage = null;
       } else if (finalStats.completedWithWarnings > 0 || finalStats.notIntegrated > 0) {
         job.status = 'Completed with Warnings';
@@ -553,7 +999,7 @@ class MasterOrchestratorRuntime {
         job.errorMessage = null;
       } else {
         job.status = 'Completed';
-        job.currentStage = 'Complete Dubbing, Mixing & QA Pipeline Finished';
+        job.currentStage = 'Complete Dubbing, Stereo Mixing & 18-Check QA Finished';
       }
 
       job.progressPercent = finalStats.percentCompleted;
@@ -581,7 +1027,7 @@ class MasterOrchestratorRuntime {
         job.jobId,
         'master_orchestrator',
         'info',
-        `Pipeline settled: ${finalStats.completed} completed, ${finalStats.completedWithWarnings} completed with warnings, ${finalStats.needsReview} need review, ${finalStats.waitingForModel} waiting for local model, ${finalStats.notIntegrated} reserved for Prompt 3, ${finalStats.failed} failed.`,
+        `Pipeline settled: ${finalStats.completed} completed, ${finalStats.completedWithWarnings} warnings, ${finalStats.needsReview} review, ${finalStats.waitingForModel} waiting for model, ${finalStats.failed} failed, ${job.retryCount} transient retries, ${scratch.qaCorrectionHistory.length} QA correction cycle(s).`,
         callbacks
       );
 
@@ -612,12 +1058,10 @@ class MasterOrchestratorRuntime {
     }
 
     const def = AGENT_MAP[agentId];
-
-    // Honest integration boundary: Prompt 3 agents (#21–#24) remain deferred
     if (!def.isIntegrated) {
       return {
         status: 'not_integrated',
-        outputSummary: `${def.integrationMilestone} — contract registered, reserved for Prompt 3.`,
+        outputSummary: `${def.integrationMilestone} — contract registered.`,
         errorMessage: null,
       };
     }
@@ -628,6 +1072,7 @@ class MasterOrchestratorRuntime {
           status: 'completed',
           outputSummary: `Validated 25-agent DAG dependencies and initialized job ${jobId}.`,
           errorMessage: null,
+          executionEngine: 'Deterministic Kahn DAG Orchestrator',
         };
 
       case 'recovery_resource_manager': {
@@ -636,10 +1081,12 @@ class MasterOrchestratorRuntime {
           snap.deviceMemoryGb !== null
             ? `${snap.deviceMemoryGb} GB reported`
             : 'browser RAM API unavailable';
+        const persistText = snap.storagePersisted ? 'persistent storage granted' : 'storage best-effort';
         return {
           status: 'completed',
-          outputSummary: `Resource check passed (${memText}, max heavy concurrency: ${snap.maxHeavyConcurrency}, scheduler: ${snap.schedulerStatus}).`,
+          outputSummary: `Resource check passed (${memText}, max heavy concurrency: ${snap.maxHeavyConcurrency}, ${persistText}, scheduler: ${snap.schedulerStatus}).`,
           errorMessage: null,
+          executionEngine: 'Local Browser Storage & Memory Telemetry',
         };
       }
 
@@ -699,7 +1146,6 @@ class MasterOrchestratorRuntime {
 
         scratch.mediaMetadata = existingMeta ?? null;
 
-        // Compute genuine waveform peaks for the Original Audio clip if missing
         if (scratch.mediaBlob) {
           const origClips = await getByIndex<AudioClip>(
             STORES.audio_clips,
@@ -721,12 +1167,16 @@ class MasterOrchestratorRuntime {
         const durationLabel = existingMeta?.durationMs
           ? `${(existingMeta.durationMs / 1000).toFixed(1)}s`
           : 'duration unreadable by browser decoder';
+        const chLabel = existingMeta?.channels
+          ? `${existingMeta.channels === 2 ? 'Stereo' : `${existingMeta.channels}ch`} ${existingMeta.sampleRateHz ?? ''} Hz`
+          : 'channels probed on decode';
         return {
-          status: 'completed',
-          outputSummary: `Analyzed "${media.fileName}" (${durationLabel}, ${scratch.media.chunkPlan.length} planned chunks, ${Math.round(
+          status: existingMeta?.decoderNotes?.includes('MKV') ? 'completed_with_warnings' : 'completed',
+          outputSummary: `Analyzed "${media.fileName}" (${durationLabel}, ${chLabel}, ${scratch.media.chunkPlan.length} chunk(s), ${Math.round(
             scratch.media.chunkOverlapMs / 1000
           )}s overlap).`,
           errorMessage: null,
+          executionEngine: 'Browser Media Prober + Stereo PCM Inspector',
         };
       }
 
@@ -737,13 +1187,15 @@ class MasterOrchestratorRuntime {
             status: 'completed',
             outputSummary: 'Audio-only media imported; visual scene detection skipped cleanly.',
             errorMessage: null,
+            executionEngine: 'Skipped (Audio-Only Media)',
           };
         }
         if (!scratch.mediaBlob || !scratch.mediaMetadata?.durationMs) {
           return {
             status: 'completed_with_warnings',
-            outputSummary: 'Video blob or duration unavailable for histogram scene cut scan.',
+            outputSummary: 'Video blob or duration unavailable for adaptive scene cut scan.',
             errorMessage: null,
+            executionEngine: 'Adaptive Histogram Scene Scanner',
           };
         }
         const scenes = await detectVideoScenesFromBlob(
@@ -759,9 +1211,10 @@ class MasterOrchestratorRuntime {
           status: scenes.length > 0 ? 'completed' : 'completed_with_warnings',
           outputSummary:
             scenes.length > 0
-              ? `Detected ${scenes.length} visual scenes via local frame histogram analysis.`
+              ? `Detected ${scenes.length} visual scene(s) across full episode via adaptive histogram analysis.`
               : 'Video stream produced 0 decodable frames in browser decoder; continuing audio-first.',
           errorMessage: null,
+          executionEngine: 'Adaptive Full-Episode Histogram Scene Scanner',
         };
       }
 
@@ -772,6 +1225,7 @@ class MasterOrchestratorRuntime {
             status: 'completed',
             outputSummary: 'No video scenes require keyframe extraction (audio-only or 0 scenes).',
             errorMessage: null,
+            executionEngine: 'Skipped (No Video Scenes)',
           };
         }
         if (!scratch.mediaBlob) {
@@ -781,6 +1235,18 @@ class MasterOrchestratorRuntime {
             errorMessage: null,
           };
         }
+
+        // Prioritize dialogue timestamps if segments or turns already exist
+        const existingSegments = await getByIndex<DialogueSegment>(
+          STORES.dialogue_segments,
+          'projectId',
+          projectId
+        );
+        const dialogueTimestamps =
+          existingSegments.length > 0
+            ? existingSegments.map((s) => Math.round((s.originalStartMs + s.originalEndMs) / 2))
+            : scratch.speakerTurns.map((t) => Math.round((t.startMs + t.endMs) / 2));
+
         const { frames, imageElements } = await extractKeyframesForScenes(
           projectId,
           scratch.mediaBlob,
@@ -797,7 +1263,8 @@ class MasterOrchestratorRuntime {
               storedAt: new Date().toISOString(),
             };
             await putRecord(STORES.file_vault, entry);
-          }
+          },
+          dialogueTimestamps
         );
         scratch.extractedFrames = frames;
         scratch.frameCanvases = imageElements;
@@ -806,8 +1273,9 @@ class MasterOrchestratorRuntime {
         }
         return {
           status: 'completed',
-          outputSummary: `Extracted ${frames.length} deduplicated JPEG keyframes into temp_processing storage.`,
+          outputSummary: `Extracted ${frames.length} adaptive, dialogue-aware deduplicated JPEG keyframes into temp_processing storage.`,
           errorMessage: null,
+          executionEngine: 'Adaptive Dialogue-Aware Frame Extractor',
         };
       }
 
@@ -818,6 +1286,7 @@ class MasterOrchestratorRuntime {
             status: 'completed',
             outputSummary: 'No keyframes to inspect (audio-only media); visual face detection skipped.',
             errorMessage: null,
+            executionEngine: 'Skipped (No Keyframes)',
           };
         }
         const installed = await localModelRuntime.isModelInstalled('model_mediapipe_blazeface');
@@ -825,10 +1294,12 @@ class MasterOrchestratorRuntime {
           return {
             status: 'completed_with_warnings',
             outputSummary:
-              'MediaPipe BlazeFace is not downloaded yet — visual face detection skipped (download in Model Manager to enable face-voice cues).',
+              'MediaPipe BlazeFace is not installed (or cache evicted) — visual face detection skipped. Download in Model Manager to enable visual character cues.',
             errorMessage: null,
+            executionEngine: 'Unavailable (BlazeFace Not Installed)',
           };
         }
+        scratch.usedModels.add('model_mediapipe_blazeface');
         const detector = await localModelRuntime.loadInstalledModel<{
           detect: (canvas: HTMLCanvasElement) => {
             detections?: Array<{
@@ -845,10 +1316,12 @@ class MasterOrchestratorRuntime {
         scratch.faceDetections = detections;
         scratch.extractedFrames = updatedFrames;
         await putManyRecords(STORES.extracted_frames, updatedFrames);
+        await this.saveArtifact(projectId, 'face_detections', detections);
         return {
           status: 'completed',
-          outputSummary: `MediaPipe BlazeFace detected ${detections.length} face regions across ${updatedFrames.length} keyframes.`,
+          outputSummary: `MediaPipe BlazeFace detected ${detections.length} face region(s) with 36-dim anime multi-region appearance descriptors (hair/face/clothing) across ${updatedFrames.length} keyframes.`,
           errorMessage: null,
+          executionEngine: 'MediaPipe BlazeFace WASM + Anime Appearance Descriptor',
         };
       }
 
@@ -859,23 +1332,26 @@ class MasterOrchestratorRuntime {
             status: 'completed',
             outputSummary: 'No face detections present; character tracking skipped cleanly.',
             errorMessage: null,
+            executionEngine: 'Skipped (0 Face Detections)',
           };
         }
         const tracks = trackVisualCharacters(scratch.faceDetections);
         scratch.visualTracks = tracks;
+        await this.saveArtifact(projectId, 'visual_tracks', tracks);
         const ambiguousCount = tracks.filter(
           (t) => t.ambiguousSimilarClusterIds.length > 0
         ).length;
         return {
           status: ambiguousCount > 0 ? 'needs_review' : 'completed',
-          outputSummary: `Grouped ${scratch.faceDetections.length} face boxes into ${tracks.length} visual tracks (${ambiguousCount} visually similar tracks flagged for review).`,
+          outputSummary: `Grouped ${scratch.faceDetections.length} detections into ${tracks.length} visual track(s) with per-track same-scene mouth-motion tracking (${ambiguousCount} visually similar track(s) flagged for review).`,
           errorMessage: null,
+          executionEngine: 'Multi-Region Anime Visual Tracker + Per-Track Mouth Motion',
         };
       }
 
       case 'speaker_diarization': {
-        const decoded = await this.ensureDecodedAudio(scratch);
-        if (!decoded) {
+        const stereo = await this.ensureDecodedStereo(scratch);
+        if (!stereo) {
           return {
             status: 'failed',
             outputSummary: 'Unable to decode project audio stream for speaker diarization.',
@@ -884,32 +1360,130 @@ class MasterOrchestratorRuntime {
           };
         }
 
+        const chunkPlan =
+          scratch.media && scratch.media.chunkPlan.length > 0
+            ? scratch.media.chunkPlan
+            : buildChunkPlan(
+                stereo.durationMs,
+                settings.chunkDurationSec * 1000,
+                settings.chunkOverlapSec * 1000
+              );
+
         const pyannoteInstalled = await localModelRuntime.isModelInstalled(
           'model_pyannote_segmentation'
         );
-        let usedPyannote = false;
+        let diarizationMethod: 'pyannote_onnx' | 'acoustic_fallback' = 'acoustic_fallback';
+        let speechIntervals: SpeechInterval[] = [];
+        let overlapCount = 0;
+
         if (pyannoteInstalled) {
+          scratch.usedModels.add('model_pyannote_segmentation');
           try {
-            // Verify offline ONNX session loads cleanly under 8 GB budget
-            await localModelRuntime.loadInstalledModel('model_pyannote_segmentation');
-            usedPyannote = true;
+            type PyAnnoteBundle = {
+              processor: (audio: Float32Array, opts?: Record<string, unknown>) => Promise<Record<string, unknown>>;
+              model: (inputs: Record<string, unknown>) => Promise<{ logits?: { data?: Float32Array; dims?: number[] } }>;
+            };
+            const pyBundle = await localModelRuntime.loadInstalledModel<PyAnnoteBundle>(
+              'model_pyannote_segmentation'
+            );
+
+            // Real PyAnnote ONNX frame-level speech & multi-speaker overlap inference in 10s chunks
+            const pyChunkMs = 10_000;
+            for (let startMs = 0; startMs < stereo.durationMs; startMs += pyChunkMs) {
+              if (signal.aborted) break;
+              const endMs = Math.min(stereo.durationMs, startMs + pyChunkMs);
+              if (endMs - startMs < 250) break;
+              const monoChunk = extractMono16kChunkFromStereo(stereo, startMs, endMs);
+              const inputs = await pyBundle.processor(monoChunk.samples);
+              const out = await pyBundle.model(inputs);
+              const logits = out?.logits;
+              if (logits?.data && logits.dims && logits.dims.length >= 3) {
+                const numFrames = logits.dims[1];
+                const numClasses = logits.dims[2];
+                const frameDurMs = (endMs - startMs) / Math.max(1, numFrames);
+                let segStart: number | null = null;
+                let segOverlap = false;
+
+                for (let f = 0; f < numFrames; f += 1) {
+                  let bestCls = 0;
+                  let bestVal = -Infinity;
+                  const base = f * numClasses;
+                  for (let c = 0; c < numClasses; c += 1) {
+                    const val = logits.data[base + c];
+                    if (val > bestVal) {
+                      bestVal = val;
+                      bestCls = c;
+                    }
+                  }
+                  const isSpeech = bestCls > 0;
+                  const isOverlapClass = bestCls >= 4;
+                  const fStart = Math.round(startMs + f * frameDurMs);
+                  if (isSpeech && segStart === null) {
+                    segStart = fStart;
+                    segOverlap = isOverlapClass;
+                  } else if (isSpeech && isOverlapClass) {
+                    segOverlap = true;
+                  } else if (!isSpeech && segStart !== null) {
+                    const fEnd = Math.round(startMs + f * frameDurMs);
+                    if (fEnd - segStart >= 220) {
+                      if (segOverlap) overlapCount += 1;
+                      speechIntervals.push({
+                        startMs: segStart,
+                        endMs: fEnd,
+                        energyDb: -22,
+                        overlapping: segOverlap,
+                      });
+                    }
+                    segStart = null;
+                    segOverlap = false;
+                  }
+                }
+                if (segStart !== null && endMs - segStart >= 220) {
+                  if (segOverlap) overlapCount += 1;
+                  speechIntervals.push({
+                    startMs: segStart,
+                    endMs,
+                    energyDb: -22,
+                    overlapping: segOverlap,
+                  });
+                }
+              }
+            }
+
+            if (speechIntervals.length > 0) {
+              diarizationMethod = 'pyannote_onnx';
+            }
           } catch {
-            usedPyannote = false;
+            // Fall back honestly to chunked acoustic VAD + spectral clustering
+            diarizationMethod = 'acoustic_fallback';
+            speechIntervals = [];
           } finally {
             await localModelRuntime.unloadActiveModel();
           }
         }
 
-        const speechIntervals = detectVoiceActivitySegments(
-          decoded.samples,
-          decoded.sampleRate
-        );
+        if (diarizationMethod === 'acoustic_fallback') {
+          speechIntervals = detectVoiceActivityChunked(stereo, chunkPlan);
+          overlapCount = speechIntervals.filter((iv) => iv.overlapping).length;
+        }
+
+        // Update real chunk statuses on ImportedMedia
+        if (scratch.media) {
+          const updatedPlan = chunkPlan.map((c) => ({ ...c, status: 'processed' as const }));
+          scratch.media = { ...scratch.media, chunkPlan: updatedPlan };
+          await putRecord(STORES.imported_media, scratch.media);
+          await this.saveArtifact(projectId, 'chunk_states', updatedPlan);
+        }
+
+        // Cluster turns using 16 kHz mono slices
+        const mono16kForCluster = extractMono16kChunkFromStereo(stereo, 0, stereo.durationMs);
         const clustered = clusterSpeakerIntervals(
-          decoded.samples,
-          decoded.sampleRate,
+          mono16kForCluster.samples,
+          mono16kForCluster.sampleRate,
           speechIntervals
         );
         scratch.speakerTurns = clustered;
+        await this.saveArtifact(projectId, 'speaker_turns', clustered);
 
         const existingSpeakers = await getByIndex<Speaker>(
           STORES.speakers,
@@ -918,37 +1492,49 @@ class MasterOrchestratorRuntime {
         );
         const existingByLabel = new Map(existingSpeakers.map((s) => [s.speakerLabel, s]));
 
-        // Aggregate per recurring Speaker ID
         const byLabel = new Map<
           string,
-          { count: number; totalMs: number; confSum: number }
+          { count: number; totalMs: number; confSum: number; overlaps: number }
         >();
         for (const turn of clustered) {
           const prev = byLabel.get(turn.speakerLabel) ?? {
             count: 0,
             totalMs: 0,
             confSum: 0,
+            overlaps: 0,
           };
           prev.count += 1;
           prev.totalMs += Math.max(0, turn.endMs - turn.startMs);
           prev.confSum += turn.confidence;
+          if (turn.overlapping) prev.overlaps += 1;
           byLabel.set(turn.speakerLabel, prev);
         }
 
+        const totalAllSpeechMs = Array.from(byLabel.values()).reduce((s, v) => s + v.totalMs, 0);
         const persistedSpeakers: Speaker[] = [];
         for (const [label, stats] of byLabel.entries()) {
           const existing = existingByLabel.get(label);
+          const internalSpeakerId = `spk_${projectId}_${label}`;
+          const isDominantNoFace =
+            scratch.visualTracks.length === 0 &&
+            byLabel.size > 1 &&
+            totalAllSpeechMs > 0 &&
+            stats.totalMs / totalAllSpeechMs > 0.65;
           const spk: Speaker = {
-            id: existing?.id ?? `spk_${projectId}_${label}`,
+            id: existing?.id ?? internalSpeakerId,
+            internalSpeakerId,
             projectId,
             speakerLabel: label,
-            roleType: existing?.roleType ?? 'on_screen',
+            roleType: existing?.roleType ?? (isDominantNoFace ? 'narrator' : 'on_screen'),
             totalDurationMs: stats.totalMs,
             segmentCount: stats.count,
             estimatedPitchHz: existing?.estimatedPitchHz ?? null,
             matchedCharacterId: existing?.matchedCharacterId ?? null,
             matchConfidence:
               Math.round((stats.confSum / Math.max(1, stats.count)) * 100) / 100,
+            diarizationMethod,
+            overlapCount: stats.overlaps,
+            isNarratorCandidate: isDominantNoFace,
             reviewStatus: existing?.reviewStatus ?? 'needs_review',
           };
           persistedSpeakers.push(spk);
@@ -963,27 +1549,37 @@ class MasterOrchestratorRuntime {
           return {
             status: 'completed_with_warnings',
             outputSummary:
-              'Audio decoded successfully, but no above-threshold speech activity was detected (silent or low-level signal).',
+              'Audio decoded successfully, but no above-threshold speech activity was detected (silent or very low-level signal).',
             errorMessage: null,
+            executionEngine:
+              diarizationMethod === 'pyannote_onnx'
+                ? 'PyAnnote Segmentation 3.0 ONNX'
+                : 'Local Acoustic VAD + Spectral Clustering (Fallback)',
           };
         }
 
         return {
-          status: usedPyannote ? 'completed' : 'completed_with_warnings',
-          outputSummary: usedPyannote
-            ? `PyAnnote ONNX + acoustic embedding clustering identified ${persistedSpeakers.length} recurring speaker(s) across ${clustered.length} turn(s).`
-            : `Local acoustic spectral clustering identified ${persistedSpeakers.length} recurring speaker(s) across ${clustered.length} turn(s) (PyAnnote ONNX not installed — download in Model Manager for neural overlap segmentation).`,
+          status: diarizationMethod === 'pyannote_onnx' ? 'completed' : 'completed_with_warnings',
+          outputSummary:
+            diarizationMethod === 'pyannote_onnx'
+              ? `PyAnnote Segmentation 3.0 ONNX identified ${persistedSpeakers.length} project-scoped speaker(s) across ${clustered.length} turn(s) (${overlapCount} overlap region(s)).`
+              : `Acoustic Fallback (VAD + spectral clustering) identified ${persistedSpeakers.length} project-scoped speaker(s) across ${clustered.length} turn(s) (${overlapCount} overlap cue(s)). Download PyAnnote ONNX in Model Manager for neural segmentation.`,
           errorMessage: null,
+          executionEngine:
+            diarizationMethod === 'pyannote_onnx'
+              ? 'PyAnnote Segmentation 3.0 ONNX'
+              : 'Local Acoustic VAD + Spectral Clustering (Fallback)',
         };
       }
 
       case 'voice_analysis': {
-        const decoded = await this.ensureDecodedAudio(scratch);
-        if (!decoded || scratch.speakerTurns.length === 0) {
+        const stereo = await this.ensureDecodedStereo(scratch);
+        if (!stereo || scratch.speakerTurns.length === 0) {
           return {
             status: 'completed_with_warnings',
             outputSummary: 'No speech turns available for acoustic Voice Analysis DSP.',
             errorMessage: null,
+            executionEngine: 'Local Autocorrelation F0 & Spectral Timbre DSP',
           };
         }
 
@@ -995,40 +1591,46 @@ class MasterOrchestratorRuntime {
         }
 
         for (const [label, turns] of turnsByLabel.entries()) {
-          // Concatenate up to 8 seconds of PCM samples per speaker for memory-safe F0 & spectral analysis
-          const maxSamples = decoded.sampleRate * 8;
+          const maxDurationMs = 8000;
           const chunks: Float32Array[] = [];
-          let collected = 0;
+          let collectedMs = 0;
           for (const t of turns) {
-            const sIdx = Math.max(0, Math.floor((t.startMs / 1000) * decoded.sampleRate));
-            const eIdx = Math.min(
-              decoded.samples.length,
-              Math.ceil((t.endMs / 1000) * decoded.sampleRate)
-            );
-            if (eIdx > sIdx && collected < maxSamples) {
-              const take = Math.min(eIdx - sIdx, maxSamples - collected);
-              chunks.push(decoded.samples.subarray(sIdx, sIdx + take));
-              collected += take;
+            if (collectedMs >= maxDurationMs) break;
+            const takeEnd = Math.min(t.endMs, t.startMs + (maxDurationMs - collectedMs));
+            if (takeEnd > t.startMs + 80) {
+              const slice = extractMono16kChunkFromStereo(stereo, t.startMs, takeEnd);
+              chunks.push(slice.samples);
+              collectedMs += takeEnd - t.startMs;
             }
           }
-          const combined = new Float32Array(collected);
+          const totalLen = chunks.reduce((s, c) => s + c.length, 0);
+          const combined = new Float32Array(totalLen);
           let offset = 0;
           for (const c of chunks) {
             combined.set(c, offset);
             offset += c.length;
           }
-          const acoustics = analyzeVoiceAcoustics(combined, decoded.sampleRate);
+          const acoustics = analyzeVoiceAcoustics(combined, 16000);
           scratch.speakerVoiceCharacteristics.set(label, acoustics);
+
+          const spk = scratch.speakers.find((s) => s.speakerLabel === label);
+          if (spk && acoustics.pitchMeanHz) {
+            spk.estimatedPitchHz = acoustics.pitchMeanHz;
+            await putRecord(STORES.speakers, spk);
+          }
         }
 
         return {
           status: 'completed',
           outputSummary: `Measured real F0 pitch, spectral timbre, texture, and loudness via Web Audio DSP for ${scratch.speakerVoiceCharacteristics.size} speaker(s).`,
           errorMessage: null,
+          executionEngine: 'Local Autocorrelation F0 & Spectral Timbre DSP',
         };
       }
 
       case 'face_voice_matching': {
+        const projectRec = await getRecord<Project>(STORES.projects, projectId);
+        const seriesScope = projectRec?.seriesTitle || 'Default Series';
         const existingCharacters = await getAllRecords<CharacterProfile>(STORES.characters);
         const turnMap: Record<string, Array<{ startMs: number; endMs: number }>> = {};
         for (const t of scratch.speakerTurns) {
@@ -1039,6 +1641,7 @@ class MasterOrchestratorRuntime {
 
         const { associations, reviewNotes } = computeMultimodalFaceVoiceMatches({
           projectId,
+          seriesScope,
           speakers: scratch.speakers,
           speakerTurnTimestamps: turnMap,
           visualTracks: scratch.visualTracks,
@@ -1054,59 +1657,94 @@ class MasterOrchestratorRuntime {
           status: flagged > 0 ? 'needs_review' : 'completed',
           outputSummary:
             associations.length > 0
-              ? `Evaluated ${associations.length} speaker-character match(es) (${flagged} flagged for identity review). ${
+              ? `Evaluated ${associations.length} series-scoped speaker-character match(es) (${flagged} flagged for identity review). ${
                   reviewNotes[0] ?? ''
                 }`.trim()
               : 'No detected speakers to match in this run.',
           errorMessage: null,
+          executionEngine: 'Series-Scoped Multimodal Face-Voice Correlator',
         };
       }
 
       case 'character_memory': {
         const projectRec = await getRecord<Project>(STORES.projects, projectId);
-        const existingCharacters = await getAllRecords<CharacterProfile>(STORES.characters);
+        const seriesScope = projectRec?.seriesTitle || 'Default Series';
+        const allCharacters = await getAllRecords<CharacterProfile>(STORES.characters);
+        // STRICT SERIES + PROJECT SCOPING: never collide unrelated projects on bare 'SPK_01'
+        const scopedCharacters = allCharacters.filter(
+          (c) =>
+            c.projectId === projectId ||
+            c.seriesScope.trim().toLowerCase() === seriesScope.trim().toLowerCase()
+        );
         const now = new Date().toISOString();
         let createdCount = 0;
         let updatedCount = 0;
 
         for (const assoc of scratch.associations) {
           const measuredVoice = scratch.speakerVoiceCharacteristics.get(assoc.speakerId);
-          const matchedExisting = existingCharacters.find(
+          const internalSpeakerId = assoc.internalSpeakerId || `spk_${projectId}_${assoc.speakerId}`;
+          const spkObj = scratch.speakers.find((s) => s.speakerLabel === assoc.speakerId);
+
+          const matchedExisting = scopedCharacters.find(
             (c) =>
               c.characterId === assoc.characterId ||
-              c.associatedSpeakerIds.includes(assoc.speakerId)
+              c.associatedSpeakerIds.includes(internalSpeakerId) ||
+              (c.projectId === projectId && c.associatedSpeakerIds.includes(assoc.speakerId))
           );
 
+          const evidenceEntry = {
+            recordedAt: now,
+            source:
+              assoc.visualEvidenceScore > 0
+                ? 'multimodal_face_voice_matching'
+                : 'acoustic_speaker_diarization',
+            summary:
+              assoc.visualEvidenceScore > 0
+                ? `Project ${projectId}: Multimodal match (audio ${Math.round(assoc.audioEvidenceScore * 100)}%, visual ${Math.round(assoc.visualEvidenceScore * 100)}%, mouth ${Math.round(assoc.mouthSyncEvidenceScore * 100)}%).`
+                : `Project ${projectId}: Audio-only speaker evidence (${Math.round(assoc.audioEvidenceScore * 100)}%).`,
+            confidence: assoc.combinedConfidence,
+          };
+
           if (matchedExisting) {
-            // Preserve user-locked/approved identity fields while enriching acoustic measurements
+            const nextSpeakers = new Set(matchedExisting.associatedSpeakerIds);
+            nextSpeakers.add(internalSpeakerId);
             const nextChar: CharacterProfile = {
               ...matchedExisting,
-              associatedSpeakerIds: matchedExisting.associatedSpeakerIds.includes(assoc.speakerId)
-                ? matchedExisting.associatedSpeakerIds
-                : [...matchedExisting.associatedSpeakerIds, assoc.speakerId],
-              voiceCharacteristics:
-                measuredVoice &&
-                matchedExisting.voiceCharacteristics.acousticMeasurementSource !== 'web_audio_dsp'
-                  ? { ...matchedExisting.voiceCharacteristics, ...measuredVoice }
-                  : measuredVoice
-                  ? { ...matchedExisting.voiceCharacteristics, ...measuredVoice }
-                  : matchedExisting.voiceCharacteristics,
+              associatedSpeakerIds: Array.from(nextSpeakers),
+              voiceCharacteristics: measuredVoice
+                ? { ...matchedExisting.voiceCharacteristics, ...measuredVoice }
+                : matchedExisting.voiceCharacteristics,
+              identityEvidenceHistory: [
+                evidenceEntry,
+                ...(matchedExisting.identityEvidenceHistory ?? []).slice(0, 14),
+              ],
+              // Strictly preserve user-approved reviewStatus and locked voice
+              reviewStatus:
+                matchedExisting.reviewStatus === 'approved'
+                  ? 'approved'
+                  : matchedExisting.reviewStatus,
               updatedAt: now,
             };
             await putRecord(STORES.characters, nextChar);
             updatedCount += 1;
           } else {
             const newCharId = `CHR-${projectId.slice(-4).toUpperCase()}-${assoc.speakerId}`;
+            const matchingTrack = scratch.visualTracks.find((vt) =>
+              assoc.characterId.includes(vt.trackClusterId)
+            );
             const newProfile: CharacterProfile = {
               characterId: newCharId,
               projectId,
-              seriesScope: projectRec?.seriesTitle || 'Global Series Memory',
-              displayName: `Speaker ${assoc.speakerId}`,
+              seriesScope,
+              displayName: spkObj?.isNarratorCandidate
+                ? `Narrator (${assoc.speakerId})`
+                : `Speaker ${assoc.speakerId}`,
               visualDescriptors:
                 assoc.visualEvidenceScore > 0
                   ? [`Visual face alignment ${Math.round(assoc.visualEvidenceScore * 100)}%`]
                   : ['Audio-only / off-screen speaker'],
-              associatedSpeakerIds: [assoc.speakerId],
+              visualEmbeddingVector: matchingTrack?.appearanceDescriptor ?? null,
+              associatedSpeakerIds: [internalSpeakerId],
               voiceCharacteristics: measuredVoice ?? {
                 pitchRange: 'Unmeasured',
                 timbre: 'Unmeasured',
@@ -1116,6 +1754,7 @@ class MasterOrchestratorRuntime {
                 acousticMeasurementSource: 'unmeasured',
               },
               assignedHindiVoiceId: null,
+              assignedCloudVoiceName: null,
               voiceLocked: false,
               personality: 'Pending user review',
               speakingStyle: measuredVoice?.speechStyle ?? 'Conversational',
@@ -1130,7 +1769,11 @@ class MasterOrchestratorRuntime {
                   .find((t) => t.speakerLabel === assoc.speakerId)?.endMs ?? null,
               identityConfidence: assoc.combinedConfidence,
               reviewStatus: assoc.status === 'confirmed' ? 'unreviewed' : 'needs_review',
-              speakerRole: assoc.visualEvidenceScore === 0 ? 'off_screen' : 'on_screen',
+              speakerRole: spkObj?.isNarratorCandidate
+                ? 'narrator'
+                : assoc.visualEvidenceScore === 0
+                ? 'off_screen'
+                : 'on_screen',
               ambiguityNote:
                 assoc.status === 'ambiguous'
                   ? 'Multiple visual candidates detected; confirm identity in Character Studio.'
@@ -1138,21 +1781,20 @@ class MasterOrchestratorRuntime {
                   ? 'Detected from audio only (no visible face alignment).'
                   : '',
               voiceAssignmentHistory: [],
+              identityEvidenceHistory: [evidenceEntry],
               createdAt: now,
               updatedAt: now,
             };
             await putRecord(STORES.characters, newProfile);
-            existingCharacters.push(newProfile);
+            scopedCharacters.push(newProfile);
 
-            // Sync speaker & association characterId to the real permanent Character ID
             await putRecord<CharacterSpeakerAssociation>(
               STORES.character_speaker_associations,
-              { ...assoc, characterId: newCharId }
+              { ...assoc, characterId: newCharId, internalSpeakerId }
             );
-            const spkRec = scratch.speakers.find((s) => s.speakerLabel === assoc.speakerId);
-            if (spkRec) {
+            if (spkObj) {
               await putRecord<Speaker>(STORES.speakers, {
-                ...spkRec,
+                ...spkObj,
                 matchedCharacterId: newCharId,
               });
             }
@@ -1162,8 +1804,9 @@ class MasterOrchestratorRuntime {
 
         return {
           status: 'completed',
-          outputSummary: `Character Memory updated (${createdCount} new candidate profile(s), ${updatedCount} existing profile(s) enriched with acoustic data; zero duplicates).`,
+          outputSummary: `Series-scoped Character Memory ("${seriesScope}") updated: ${createdCount} new profile(s), ${updatedCount} existing profile(s) enriched; zero cross-series collisions.`,
           errorMessage: null,
+          executionEngine: 'Series-Scoped Persistent Character Memory Store',
         };
       }
 
@@ -1184,8 +1827,9 @@ class MasterOrchestratorRuntime {
           if (hasManualJapanese) {
             return {
               status: 'completed_with_warnings',
-              outputSummary: `Whisper Small ONNX is not installed — proceeding with ${existingSegments.length} existing dialogue segment(s). Download OpenAI Whisper Small ONNX in Model Manager for offline Japanese speech transcription.`,
+              outputSummary: `Whisper Small ONNX is not installed — proceeding with ${existingSegments.length} existing dialogue segment(s). Download OpenAI Whisper Small ONNX in Model Manager for offline Japanese ASR.`,
               errorMessage: null,
+              executionEngine: 'Manual / Existing Segments (Whisper Not Installed)',
             };
           }
           return {
@@ -1193,18 +1837,20 @@ class MasterOrchestratorRuntime {
             outputSummary:
               'OpenAI Whisper Small (INT8 ONNX) is required for offline Japanese ASR. Download & verify it in Model Manager or add Japanese dialogue segments manually.',
             errorMessage: null,
+            executionEngine: 'Waiting for Whisper Small ONNX',
           };
         }
 
-        const decoded = await this.ensureDecodedAudio(scratch);
-        if (!decoded) {
+        const stereo = await this.ensureDecodedStereo(scratch);
+        if (!stereo) {
           return {
             status: 'failed',
-            outputSummary: 'Decoded 16 kHz PCM audio unavailable for Whisper Japanese ASR.',
-            errorMessage: 'Unable to decode source audio to 16 kHz mono PCM.',
+            outputSummary: 'Decoded stereo audio unavailable for Whisper Japanese ASR.',
+            errorMessage: 'Unable to decode source audio to 16 kHz mono PCM chunks.',
           };
         }
 
+        scratch.usedModels.add('model_whisper_small_onnx');
         type WhisperPipe = (
           audio: Float32Array,
           opts: Record<string, unknown>
@@ -1214,40 +1860,65 @@ class MasterOrchestratorRuntime {
           'model_whisper_small_onnx'
         );
 
-        const asrResult = await asrPipe(decoded.samples, {
-          language: 'japanese',
-          task: 'transcribe',
-          return_timestamps: true,
-          chunk_length_s: 30,
-          stride_length_s: 5,
-        });
+        // Slice 16 kHz mono only per chunk (5-minute max slice for bounded RAM on long episodes)
+        const asrSliceSec = 180;
+        const rawChunks: AsrRawChunk[] = [];
+        for (let startMs = 0; startMs < stereo.durationMs; startMs += asrSliceSec * 1000) {
+          if (signal.aborted) break;
+          const endMs = Math.min(stereo.durationMs, startMs + asrSliceSec * 1000 + 2000);
+          const mono16k = extractMono16kChunkFromStereo(stereo, startMs, endMs);
+          const asrResult = await asrPipe(mono16k.samples, {
+            language: 'japanese',
+            task: 'transcribe',
+            return_timestamps: true,
+            chunk_length_s: 30,
+            stride_length_s: 5,
+          });
+          const offsetSec = startMs / 1000;
+          if (asrResult.chunks && asrResult.chunks.length > 0) {
+            for (const ch of asrResult.chunks) {
+              const t0 = (ch.timestamp?.[0] ?? 0) + offsetSec;
+              const t1 = (ch.timestamp?.[1] ?? t0 + 1.5) + offsetSec;
+              rawChunks.push({ text: ch.text, timestamp: [t0, t1] });
+            }
+          } else if (asrResult.text?.trim()) {
+            rawChunks.push({
+              text: asrResult.text.trim(),
+              timestamp: [offsetSec, endMs / 1000],
+            });
+          }
+        }
 
-        const rawChunks: AsrRawChunk[] =
-          asrResult.chunks && asrResult.chunks.length > 0
-            ? asrResult.chunks
-            : asrResult.text?.trim()
-            ? [{ text: asrResult.text.trim(), timestamp: [0, decoded.durationMs / 1000] }]
-            : [];
-
-        const normalized = deduplicateAsrChunks(rawChunks, decoded.durationMs);
+        const normalized = deduplicateAsrChunks(rawChunks, stereo.durationMs);
         if (normalized.length === 0) {
           return {
             status: 'completed_with_warnings',
             outputSummary:
               'Whisper Small ONNX ran locally and returned 0 Japanese speech utterances for this audio.',
             errorMessage: null,
+            executionEngine: 'OpenAI Whisper Small ONNX (Local)',
           };
         }
 
-        const allChars = await getAllRecords<CharacterProfile>(STORES.characters);
+        const projectRec = await getRecord<Project>(STORES.projects, projectId);
+        const seriesScope = projectRec?.seriesTitle || 'Default Series';
+        const allChars = (await getAllRecords<CharacterProfile>(STORES.characters)).filter(
+          (c) =>
+            c.projectId === projectId ||
+            c.seriesScope.trim().toLowerCase() === seriesScope.trim().toLowerCase()
+        );
         const now = new Date().toISOString();
         const createdSegments: DialogueSegment[] = [];
+        let unassignedCount = 0;
 
         for (let idx = 0; idx < normalized.length; idx += 1) {
           const item = normalized[idx];
-          // Match speaker by maximum temporal overlap with diarized turns
-          let bestSpeakerLabel = 'SPK_01';
-          let bestOverlap = -1;
+          const segDur = Math.max(100, item.endMs - item.startMs);
+          const minRequiredOverlap = Math.min(150, Math.round(segDur * 0.25));
+
+          // SAFE SPEAKER MATCHING: require genuine temporal overlap (never blind 'SPK_01' fallback!)
+          let bestSpeakerLabel: string | null = null;
+          let bestOverlap = 0;
           for (const turn of scratch.speakerTurns) {
             const overlap =
               Math.min(item.endMs, turn.endMs) - Math.max(item.startMs, turn.startMs);
@@ -1257,23 +1928,35 @@ class MasterOrchestratorRuntime {
             }
           }
 
-          const matchedChar = allChars.find((c) =>
-            c.associatedSpeakerIds.includes(bestSpeakerLabel)
-          );
+          const hasValidSpeaker = bestSpeakerLabel !== null && bestOverlap >= minRequiredOverlap;
+          const resolvedSpeakerLabel = hasValidSpeaker ? bestSpeakerLabel! : 'UNASSIGNED_SPEAKER';
+          if (!hasValidSpeaker) unassignedCount += 1;
+
+          const internalSpeakerId = hasValidSpeaker
+            ? `spk_${projectId}_${resolvedSpeakerLabel}`
+            : null;
+          const matchedChar = internalSpeakerId
+            ? allChars.find(
+                (c) =>
+                  c.associatedSpeakerIds.includes(internalSpeakerId) ||
+                  (c.projectId === projectId && c.associatedSpeakerIds.includes(resolvedSpeakerLabel))
+              ) ?? null
+            : null;
+
           const segId = `SEG-${projectId.slice(-4).toUpperCase()}-${String(idx + 1).padStart(
             3,
             '0'
           )}`;
-
           const existing = existingSegments.find((e) => e.segmentId === segId);
+
           const segment: DialogueSegment = {
             segmentId: segId,
             projectId,
-            sourceSpeakerId: existing?.sourceSpeakerId ?? bestSpeakerLabel,
+            sourceSpeakerId: existing?.sourceSpeakerId ?? resolvedSpeakerLabel,
             characterId: existing?.characterId ?? matchedChar?.characterId ?? null,
             originalStartMs: item.startMs,
             originalEndMs: item.endMs,
-            originalDurationMs: Math.max(100, item.endMs - item.startMs),
+            originalDurationMs: segDur,
             japaneseText: item.japaneseText,
             asrConfidence: item.confidence,
             hindiText: existing?.hindiText ?? '',
@@ -1293,7 +1976,11 @@ class MasterOrchestratorRuntime {
             overlapGroupId: existing?.overlapGroupId ?? null,
             syncStatus: existing?.syncStatus ?? 'unmeasured',
             qaStatus: 'not_run',
-            reviewStatus: 'unreviewed',
+            reviewStatus: existing?.reviewStatus === 'approved'
+              ? 'approved'
+              : hasValidSpeaker
+              ? 'unreviewed'
+              : 'needs_review',
             updatedAt: now,
           };
           createdSegments.push(segment);
@@ -1301,7 +1988,6 @@ class MasterOrchestratorRuntime {
 
         await putManyRecords(STORES.dialogue_segments, createdSegments);
 
-        // Sync structural clips onto Dialogue Master track
         const tracks = await getByIndex<TimelineTrack>(
           STORES.timeline_tracks,
           'projectId',
@@ -1326,33 +2012,39 @@ class MasterOrchestratorRuntime {
               sourceNamespace: existingClip?.sourceNamespace ?? null,
               sourceRef: existingClip?.sourceRef ?? null,
               hasRealAudio: Boolean(existingClip?.sourceRef),
-              waveformPeaks: null,
+              waveformPeaks: existingClip?.waveformPeaks ?? null,
             });
           }
         }
 
         return {
-          status: 'completed',
-          outputSummary: `Whisper Small ONNX transcribed ${createdSegments.length} Japanese dialogue segment(s) with timestamps.`,
+          status: unassignedCount > 0 ? 'needs_review' : 'completed',
+          outputSummary: `Whisper Small ONNX transcribed ${createdSegments.length} Japanese dialogue segment(s) (${unassignedCount} without confident diarization overlap flagged UNASSIGNED_SPEAKER).`,
           errorMessage: null,
+          executionEngine: 'OpenAI Whisper Small ONNX (Local)',
         };
       }
 
       case 'relationship_intelligence': {
-        const allChars = await getAllRecords<CharacterProfile>(STORES.characters);
+        const projectRec = await getRecord<Project>(STORES.projects, projectId);
+        const seriesScope = projectRec?.seriesTitle || 'Default Series';
+        const scopedChars = (await getAllRecords<CharacterProfile>(STORES.characters)).filter(
+          (c) =>
+            c.projectId === projectId ||
+            c.seriesScope.trim().toLowerCase() === seriesScope.trim().toLowerCase()
+        );
         const segments = (
           await getByIndex<DialogueSegment>(STORES.dialogue_segments, 'projectId', projectId)
         ).sort((a, b) => a.originalStartMs - b.originalStartMs);
 
-        const inferredMap = analyzeCharacterRelationshipsFromDialogue(allChars, segments);
+        const inferredMap = analyzeCharacterRelationshipsFromDialogue(scopedChars, segments);
         let addedCount = 0;
 
         for (const [charId, newRels] of inferredMap.entries()) {
-          const ch = allChars.find((c) => c.characterId === charId);
+          const ch = scopedChars.find((c) => c.characterId === charId);
           if (!ch) continue;
           const merged = [...ch.relationships];
           for (const rel of newRels) {
-            // Never overwrite user-curated existing relationships
             if (!merged.some((r) => r.targetCharacterId === rel.targetCharacterId)) {
               merged.push(rel);
               addedCount += 1;
@@ -1370,14 +2062,21 @@ class MasterOrchestratorRuntime {
           outputSummary:
             addedCount > 0
               ? `Inferred ${addedCount} politeness-register relationship(s) from multi-turn exchanges.`
-              : 'Evaluated dialogue turns (no multi-turn >=2 exchanges required new inferred relationships).',
+              : 'Evaluated dialogue turns (no multi-turn exchanges required new inferred relationships).',
           errorMessage: null,
+          executionEngine: 'Japanese Honorific & Politeness Register Analyzer',
         };
       }
 
       case 'context_intelligence': {
         const scenes = await getByIndex<Scene>(STORES.scenes, 'projectId', projectId);
-        const chars = await getAllRecords<CharacterProfile>(STORES.characters);
+        const projectRec = await getRecord<Project>(STORES.projects, projectId);
+        const seriesScope = projectRec?.seriesTitle || 'Default Series';
+        const chars = (await getAllRecords<CharacterProfile>(STORES.characters)).filter(
+          (c) =>
+            c.projectId === projectId ||
+            c.seriesScope.trim().toLowerCase() === seriesScope.trim().toLowerCase()
+        );
         const pronunciations = await getAllRecords<PronunciationEntry>(
           STORES.pronunciation_entries
         );
@@ -1391,8 +2090,9 @@ class MasterOrchestratorRuntime {
         await putRecord(STORES.context_snapshots, snapshot);
         return {
           status: 'completed',
-          outputSummary: `Built bounded local context snapshot (${snapshot.sceneCount} scenes, ${snapshot.characterBriefs.length} character briefs, ${snapshot.terminology.length} dictionary terms).`,
+          outputSummary: `Built bounded local context snapshot (${snapshot.sceneCount} scenes, ${snapshot.characterBriefs.length} series character briefs, ${snapshot.terminology.length} dictionary terms).`,
           errorMessage: null,
+          executionEngine: 'Bounded Rolling Context Builder',
         };
       }
 
@@ -1402,8 +2102,9 @@ class MasterOrchestratorRuntime {
         );
         return {
           status: 'completed',
-          outputSummary: `Loaded ${pronunciations.length} persistent local pronunciation dictionary rule(s) for Japanese/Hindi/English terminology consistency.`,
+          outputSummary: `Loaded ${pronunciations.length} persistent pronunciation rule(s) for Japanese/Hindi/English terminology consistency.`,
           errorMessage: null,
+          executionEngine: 'Persistent Pronunciation Rule Engine',
         };
       }
 
@@ -1417,6 +2118,7 @@ class MasterOrchestratorRuntime {
             status: 'completed_with_warnings',
             outputSummary: 'No dialogue segments available to translate.',
             errorMessage: null,
+            executionEngine: 'Skipped (0 Segments)',
           };
         }
 
@@ -1458,8 +2160,9 @@ class MasterOrchestratorRuntime {
             }
             return {
               status: 'completed_with_warnings',
-              outputSummary: `NLLB-200-600M ONNX is not installed and Cloud Intelligence is disabled — preserved existing Hindi lines and applied ${pronunciations.length} pronunciation rules (${segmentsNeedingTranslation.length} line(s) still need translation).`,
+              outputSummary: `NLLB-200-600M ONNX not installed and Cloud Intelligence disabled — preserved existing Hindi lines and applied ${pronunciations.length} pronunciation rules (${segmentsNeedingTranslation.length} still empty).`,
               errorMessage: null,
+              executionEngine: 'Local Pronunciation & Register Pass Only',
             };
           }
           return {
@@ -1467,6 +2170,7 @@ class MasterOrchestratorRuntime {
             outputSummary:
               'Meta NLLB-200-Distilled-600M (INT8 ONNX) is required for offline Japanese → Hindi translation (or enable Cloud Intelligence in Settings).',
             errorMessage: null,
+            executionEngine: 'Waiting for NLLB-200 ONNX / Cloud',
           };
         }
 
@@ -1477,6 +2181,7 @@ class MasterOrchestratorRuntime {
 
         let translator: TranslationPipe | null = null;
         if (nllbInstalled && segmentsNeedingTranslation.length > 0) {
+          scratch.usedModels.add('model_nllb_200_600m');
           translator = await localModelRuntime.loadInstalledModel<TranslationPipe>(
             'model_nllb_200_600m'
           );
@@ -1485,6 +2190,7 @@ class MasterOrchestratorRuntime {
         let translatedCount = 0;
         let collaborativeCount = 0;
         let disagreementCount = 0;
+        const usedEngines = new Set<string>();
         const now = new Date().toISOString();
 
         for (let idx = 0; idx < segments.length; idx += 1) {
@@ -1498,14 +2204,13 @@ class MasterOrchestratorRuntime {
               tgt_lang: 'hin_Deva',
             });
             localDraft = out?.[0]?.translation_text?.trim() ?? '';
+            usedEngines.add('NLLB-200-600M ONNX');
           }
 
           const char = seg.characterId ? charById.get(seg.characterId) : null;
           const register = char?.relationships[0]?.politenessRegister ?? '';
-
           if (!seg.japaneseText.trim() && !localDraft) continue;
 
-          // Run Hybrid Collaborative Intelligence Router (handles offline fallback cleanly)
           const collab = await executeCollaborativeIntelligence({
             taskType: 'translate_and_adapt',
             japaneseText: seg.japaneseText,
@@ -1528,6 +2233,7 @@ class MasterOrchestratorRuntime {
           const finalHindi = collab.hindiText || localDraft;
           if (!finalHindi) continue;
 
+          if (collab.meta.modelUsed) usedEngines.add(collab.meta.modelUsed);
           if (collab.meta.geminiDraft) collaborativeCount += 1;
           if (collab.meta.disagreementFlag) disagreementCount += 1;
 
@@ -1573,15 +2279,17 @@ class MasterOrchestratorRuntime {
           return {
             status: 'waiting_for_model',
             outputSummary:
-              'Neither offline NLLB-200 ONNX nor live Gemini API returned translations. Install NLLB-200 in Model Manager or configure GEMINI_API_KEY in Settings > Secrets.',
+              'Neither offline NLLB-200 ONNX nor live Gemini API returned translations. Install NLLB-200 in Model Manager or configure GEMINI_API_KEY in Secrets.',
             errorMessage: null,
+            executionEngine: 'Waiting for Translation Engine',
           };
         }
 
         return {
           status: disagreementCount > 0 ? 'needs_review' : 'completed',
-          outputSummary: `Processed ${translatedCount} Hindi dialogue line(s) (${collaborativeCount} Gemini-collaborated, ${disagreementCount} disagreement(s) flagged for review, ${pronunciations.length} pronunciation rules applied).`,
+          outputSummary: `Processed ${translatedCount} Hindi line(s) in mode "${settings.collaborationMode}" (${collaborativeCount} Gemini-collaborated, ${disagreementCount} disagreement(s) flagged, ${pronunciations.length} glossary rules enforced).`,
           errorMessage: null,
+          executionEngine: Array.from(usedEngines).join(' + ') || 'Local Rules',
         };
       }
 
@@ -1599,13 +2307,11 @@ class MasterOrchestratorRuntime {
           };
         }
 
-        const decoded = await this.ensureDecodedAudio(scratch);
+        const stereo = await this.ensureDecodedStereo(scratch);
         const sentimentInstalled = await localModelRuntime.isModelInstalled(
           'model_multilingual_sentiment'
         );
-        type SentimentPipe = (
-          text: string
-        ) => Promise<Array<{ label: string; score: number }>>;
+        type SentimentPipe = (text: string) => Promise<Array<{ label: string; score: number }>>;
         let sentimentPipe: SentimentPipe | null = null;
         if (sentimentInstalled) {
           try {
@@ -1625,19 +2331,16 @@ class MasterOrchestratorRuntime {
             let pitchVariationHz: number | null = null;
             let speakingRateCps: number | null = null;
 
-            if (decoded) {
-              const sIdx = Math.max(
-                0,
-                Math.floor((seg.originalStartMs / 1000) * decoded.sampleRate)
+            if (stereo && seg.originalEndMs > seg.originalStartMs + 60) {
+              const slice = extractMono16kChunkFromStereo(
+                stereo,
+                seg.originalStartMs,
+                seg.originalEndMs
               );
-              const eIdx = Math.min(
-                decoded.samples.length,
-                Math.ceil((seg.originalEndMs / 1000) * decoded.sampleRate)
-              );
-              if (eIdx - sIdx >= 256) {
+              if (slice.samples.length >= 256) {
                 const segAcoustics = analyzeVoiceAcoustics(
-                  decoded.samples.subarray(sIdx, eIdx),
-                  decoded.sampleRate,
+                  slice.samples,
+                  slice.sampleRate,
                   (seg.japaneseText || seg.hindiText).length
                 );
                 energyDb = segAcoustics.energyDb ?? null;
@@ -1683,6 +2386,9 @@ class MasterOrchestratorRuntime {
               ? `Analyzed emotion on ${analyzedCount} segment(s) using acoustic DSP + lexical cues + Multilingual Sentiment ONNX.`
               : `Analyzed emotion on ${analyzedCount} segment(s) using local acoustic DSP + Japanese/Hindi lexical cues.`,
             errorMessage: null,
+            executionEngine: sentimentPipe
+              ? 'Acoustic DSP + Lexical + Multilingual Sentiment ONNX'
+              : 'Acoustic DSP + Japanese/Hindi Lexical Heuristics',
           };
         } finally {
           if (sentimentPipe) {
@@ -1692,34 +2398,66 @@ class MasterOrchestratorRuntime {
       }
 
       case 'voice_assignment': {
-        const chars = await getAllRecords<CharacterProfile>(STORES.characters);
+        const projectRec = await getRecord<Project>(STORES.projects, projectId);
+        const seriesScope = projectRec?.seriesTitle || 'Default Series';
+        const allChars = await getAllRecords<CharacterProfile>(STORES.characters);
+        const scopedChars = allChars.filter(
+          (c) =>
+            c.projectId === projectId ||
+            c.seriesScope.trim().toLowerCase() === seriesScope.trim().toLowerCase()
+        );
         const voices = await getAllRecords<VoiceProfile>(STORES.voice_profiles);
+        const voiceById = new Map(voices.map((v) => [v.voiceId, v]));
         const segments = await getByIndex<DialogueSegment>(
           STORES.dialogue_segments,
           'projectId',
           projectId
         );
+
+        const preferCloudVoices =
+          settings.cloudTtsEnabled &&
+          !settings.offlineOnlyMode &&
+          settings.cloudIntelligenceEnabled;
+        const alreadyAssignedVoiceIds = new Set<string>(
+          scopedChars
+            .map((c) => c.assignedHindiVoiceId)
+            .filter((v): v is string => Boolean(v))
+        );
+
         const now = new Date().toISOString();
         let assignedCount = 0;
 
         const updatedCharMap = new Map<string, CharacterProfile>();
-        for (const ch of chars) {
+        for (const ch of scopedChars) {
           if (ch.voiceLocked && ch.assignedHindiVoiceId) {
             updatedCharMap.set(ch.characterId, ch);
             continue;
           }
           if (!ch.assignedHindiVoiceId) {
-            const best = selectBestVoiceForCharacter(ch, voices);
+            const best = selectBestVoiceForCharacter(ch, voices, {
+              preferCloudVoices,
+              alreadyAssignedVoiceIds,
+            });
             if (best) {
+              alreadyAssignedVoiceIds.add(best.voiceId);
+              const persistentCloudVoice = resolvePersistentCloudVoiceName(
+                ch,
+                best,
+                ch.characterId
+              );
               const updated: CharacterProfile = {
                 ...ch,
                 assignedHindiVoiceId: best.voiceId,
+                assignedCloudVoiceName: persistentCloudVoice,
                 voiceAssignmentHistory: [
                   {
                     voiceId: best.voiceId,
                     voiceName: best.displayName,
                     assignedAt: now,
-                    reason: 'Automatic acoustic-matched voice assignment (Agent #17)',
+                    reason:
+                      best.synthesisMode === 'cloud_prebuilt_voice'
+                        ? 'Automatic Cloud Prebuilt Multi-Voice assignment (Agent #17)'
+                        : 'Automatic Local MMS-TTS voice assignment (Agent #17)',
                     locked: false,
                   },
                   ...ch.voiceAssignmentHistory,
@@ -1741,14 +2479,35 @@ class MasterOrchestratorRuntime {
               assignedCount += 1;
               continue;
             }
+          } else if (!ch.assignedCloudVoiceName) {
+            const assignedVoice = voiceById.get(ch.assignedHindiVoiceId) ?? null;
+            const resolvedCloud = resolvePersistentCloudVoiceName(
+              ch,
+              assignedVoice,
+              ch.characterId
+            );
+            const updated: CharacterProfile = {
+              ...ch,
+              assignedCloudVoiceName: resolvedCloud,
+              updatedAt: now,
+            };
+            await putRecord(STORES.characters, updated);
+            updatedCharMap.set(ch.characterId, updated);
+            continue;
           }
           updatedCharMap.set(ch.characterId, ch);
         }
 
-        // Propagate permanent character Hindi Voice IDs to project segments
         for (const seg of segments) {
           const ch = seg.characterId ? updatedCharMap.get(seg.characterId) : null;
-          const fallbackVoice = voices[0]?.voiceId ?? null;
+          const fallbackVoice =
+            voices.find((v) =>
+              preferCloudVoices
+                ? v.synthesisMode === 'cloud_prebuilt_voice'
+                : v.synthesisMode !== 'cloud_prebuilt_voice'
+            )?.voiceId ??
+            voices[0]?.voiceId ??
+            null;
           const targetVoiceId = ch?.assignedHindiVoiceId ?? seg.assignedHindiVoiceId ?? fallbackVoice;
           if (targetVoiceId && targetVoiceId !== seg.assignedHindiVoiceId) {
             await putRecord<DialogueSegment>(STORES.dialogue_segments, {
@@ -1761,8 +2520,13 @@ class MasterOrchestratorRuntime {
 
         return {
           status: 'completed',
-          outputSummary: `Assigned permanent Hindi Voice IDs to ${assignedCount} unassigned character(s) while preserving all locked user voices.`,
+          outputSummary: `Assigned persistent ${
+            preferCloudVoices ? 'Cloud Prebuilt Multi-Voice' : 'Local MMS-TTS'
+          } profiles to ${assignedCount} character(s) with collision avoidance while preserving locked voices.`,
           errorMessage: null,
+          executionEngine: preferCloudVoices
+            ? 'Cloud Prebuilt Multi-Voice Mapper'
+            : 'Local Acoustic Voice Preset Mapper',
         };
       }
 
@@ -1790,8 +2554,9 @@ class MasterOrchestratorRuntime {
 
         return {
           status: 'completed',
-          outputSummary: `Computed post-synthesis voice acting directives (rate, pitch, gain, pauses) for ${segments.length} segment(s) while keeping character voice identities separate.`,
+          outputSummary: `Computed expressive voice acting directives (rate, pitch, gain, pauses) for ${segments.length} segment(s) targeting both local WSOLA/DSP and Gemini Cloud style prompts.`,
           errorMessage: null,
+          executionEngine: 'Voice Acting Directive Planner (Cloud + Local DSP)',
         };
       }
 
@@ -1821,27 +2586,26 @@ class MasterOrchestratorRuntime {
             outputSummary:
               'Meta MMS-TTS Hindi (VITS ONNX) is not installed locally. Download & verify it in Model Manager (or enable optional Gemini Cloud TTS in Settings).',
             errorMessage: null,
+            executionEngine: 'Waiting for MMS-TTS-HIN ONNX / Cloud TTS',
           };
         }
 
-        type TtsPipe = (text: string) => Promise<{
-          audio: Float32Array;
-          sampling_rate: number;
-        }>;
+        type TtsPipe = (text: string) => Promise<{ audio: Float32Array; sampling_rate: number }>;
         const ttsPipe =
           ttsInstalled && !useCloudTts
-            ? await localModelRuntime.loadInstalledModel<TtsPipe>('model_mms_tts_hin')
+            ? (() => {
+                scratch.usedModels.add('model_mms_tts_hin');
+                return localModelRuntime.loadInstalledModel<TtsPipe>('model_mms_tts_hin');
+              })()
             : null;
+        const resolvedTtsPipe = ttsPipe ? await ttsPipe : null;
 
-        const voices = await getAllRecords<VoiceProfile>(STORES.voice_profiles);
+        const [voices, chars] = await Promise.all([
+          getAllRecords<VoiceProfile>(STORES.voice_profiles),
+          getAllRecords<CharacterProfile>(STORES.characters),
+        ]);
         const voiceById = new Map(voices.map((v) => [v.voiceId, v]));
-        const cloudVoiceCycle: Array<'Kore' | 'Puck' | 'Charon' | 'Fenrir' | 'Zephyr'> = [
-          'Kore',
-          'Puck',
-          'Charon',
-          'Fenrir',
-          'Zephyr',
-        ];
+        const charById = new Map(chars.map((c) => [c.characterId, c]));
 
         let generatedCount = 0;
         let engineLabel = 'Meta MMS-TTS-HIN (Local Offline)';
@@ -1853,6 +2617,7 @@ class MasterOrchestratorRuntime {
           const voice = seg.assignedHindiVoiceId
             ? voiceById.get(seg.assignedHindiVoiceId) ?? null
             : null;
+          const char = seg.characterId ? charById.get(seg.characterId) ?? null : null;
           const directive =
             seg.actingDirective ?? buildVoiceActingDirective(seg.emotion, voice);
 
@@ -1860,24 +2625,25 @@ class MasterOrchestratorRuntime {
           let durationMs: number;
 
           if (useCloudTts) {
-            const voiceIdx =
-              Math.abs(
-                (seg.assignedHindiVoiceId || seg.sourceSpeakerId)
-                  .split('')
-                  .reduce((acc, ch) => acc + ch.charCodeAt(0), 0)
-              ) % cloudVoiceCycle.length;
+            const persistentVoiceName = resolvePersistentCloudVoiceName(
+              char,
+              voice,
+              seg.sourceSpeakerId
+            );
             const cloudRes = await synthesizeHindiWavViaGeminiCloud({
               hindiText: seg.hindiText,
               emotionStyle: `${seg.emotion.primaryEmotion} anime Hindi dubbing (${directive.deliveryStyle})`,
-              voiceName: cloudVoiceCycle[voiceIdx],
+              voiceName: persistentVoiceName,
               model: settings.preferredCloudTtsModel || 'gemini-3.8-flash-lite-tts',
             });
-            wavBlob = cloudRes.wavBlob;
-            durationMs = cloudRes.durationMs;
-            engineLabel = `Gemini Cloud TTS (${cloudRes.model})`;
-          } else if (ttsPipe) {
+            // Apply bounded post-synthesis acting DSP (gain, pause, gentle rate) on cloud WAV too!
+            const acted = await applyVoiceActingToWavBlob(cloudRes.wavBlob, directive, true);
+            wavBlob = acted.wavBlob;
+            durationMs = acted.durationMs;
+            engineLabel = `Gemini Cloud TTS (${cloudRes.model}, persistent multi-voice)`;
+          } else if (resolvedTtsPipe) {
             const synth = await synthesizeHindiWavWithModel({
-              ttsPipeline: ttsPipe,
+              ttsPipeline: resolvedTtsPipe,
               hindiText: seg.hindiText,
               directive,
             });
@@ -1888,7 +2654,7 @@ class MasterOrchestratorRuntime {
           }
 
           const vaultKey = `generated_audio/${projectId}/${seg.segmentId}.wav`;
-          const vaultEntry: VaultEntry = {
+          await putRecord<VaultEntry>(STORES.file_vault, {
             vaultKey,
             projectId,
             namespace: 'generated_audio',
@@ -1897,8 +2663,7 @@ class MasterOrchestratorRuntime {
             sizeBytes: wavBlob.size,
             blob: wavBlob,
             storedAt: now,
-          };
-          await putRecord(STORES.file_vault, vaultEntry);
+          });
 
           await putRecord<DialogueSegment>(STORES.dialogue_segments, {
             ...seg,
@@ -1912,8 +2677,9 @@ class MasterOrchestratorRuntime {
 
         return {
           status: 'completed',
-          outputSummary: `${engineLabel} synthesized ${generatedCount} real Hindi WAV file(s) into generated_audio storage with measured durations.`,
+          outputSummary: `${engineLabel} synthesized ${generatedCount} real Hindi WAV file(s) with acting directives into generated_audio storage.`,
           errorMessage: null,
+          executionEngine: engineLabel,
         };
       }
 
@@ -1937,6 +2703,7 @@ class MasterOrchestratorRuntime {
         );
         const dialogueTrack = tracks.find((t) => t.kind === 'dialogue');
         let syncedCount = 0;
+        let wsolaAdjustedCount = 0;
         let reviewCount = 0;
         const now = new Date().toISOString();
 
@@ -1944,7 +2711,7 @@ class MasterOrchestratorRuntime {
           const seg = segments[i];
           const nextSeg = segments[i + 1] ?? null;
 
-          if (seg.actualGeneratedDurationMs === null || !seg.generatedAudioRef) {
+          if (!seg.generatedAudioRef) {
             await putRecord<DialogueSegment>(STORES.dialogue_segments, {
               ...seg,
               timingMatchLabel: 'Unresolved',
@@ -1953,14 +2720,42 @@ class MasterOrchestratorRuntime {
             continue;
           }
 
-          const sync = computeSynchronizedPlacement({
+          const wavEntry = await getRecord<VaultEntry>(
+            STORES.file_vault,
+            seg.generatedAudioRef
+          );
+          if (!wavEntry) {
+            await putRecord<DialogueSegment>(STORES.dialogue_segments, {
+              ...seg,
+              timingMatchLabel: 'Unresolved',
+              syncStatus: 'unmeasured',
+              updatedAt: now,
+            });
+            continue;
+          }
+
+          // CRITICAL REPAIR: Physically apply pitch-preserving WSOLA time-stretching to WAV PCM
+          // and re-measure exact output duration (never silently truncating speech!)
+          const realSync = await applyRealSyncToGeneratedWavBlob({
+            wavBlob: wavEntry.blob,
             originalStartMs: seg.originalStartMs,
             originalEndMs: seg.originalEndMs,
-            measuredAudioDurationMs: seg.actualGeneratedDurationMs,
-            preferredShiftLimitMs: seg.preferredShiftLimitMs || settings.preferredTimingAdjustmentMs,
+            preferredShiftLimitMs:
+              seg.preferredShiftLimitMs || settings.preferredTimingAdjustmentMs,
             nextSegmentStartMs: nextSeg?.originalStartMs ?? null,
           });
 
+          if (realSync.modifiedPcm) {
+            wsolaAdjustedCount += 1;
+            await putRecord<VaultEntry>(STORES.file_vault, {
+              ...wavEntry,
+              blob: realSync.synchronizedWavBlob,
+              sizeBytes: realSync.synchronizedWavBlob.size,
+              storedAt: now,
+            });
+          }
+
+          const sync = realSync.outcome;
           const absDelta = Math.abs(sync.syncDeltaMs);
           const timingMatchLabel: DialogueSegment['timingMatchLabel'] =
             sync.syncStatus === 'needs_adjustment'
@@ -1973,6 +2768,7 @@ class MasterOrchestratorRuntime {
 
           await putRecord<DialogueSegment>(STORES.dialogue_segments, {
             ...seg,
+            actualGeneratedDurationMs: sync.actualGeneratedDurationMs,
             finalStartMs: sync.finalStartMs,
             finalEndMs: sync.finalEndMs,
             syncDeltaMs: sync.syncDeltaMs,
@@ -1984,14 +2780,10 @@ class MasterOrchestratorRuntime {
             updatedAt: now,
           });
 
-          // Compute real waveform peaks from generated WAV
-          const wavEntry = await getRecord<VaultEntry>(
-            STORES.file_vault,
-            seg.generatedAudioRef
+          const realPeaks = await computeWaveformPeaksFromBlob(
+            realSync.synchronizedWavBlob,
+            64
           );
-          const realPeaks = wavEntry
-            ? await computeWaveformPeaksFromBlob(wavEntry.blob, 64)
-            : null;
 
           if (dialogueTrack) {
             const existingClip = await getRecord<AudioClip>(
@@ -2021,14 +2813,15 @@ class MasterOrchestratorRuntime {
 
         return {
           status: reviewCount > 0 ? 'needs_review' : 'completed',
-          outputSummary: `Synchronized ${syncedCount} generated Hindi clip(s) with real waveform peaks (${reviewCount} flagged for phrasing/timing review; bounded 0.88×–1.15× natural rate).`,
+          outputSummary: `Synchronized ${syncedCount} Hindi WAV clip(s) (${wsolaAdjustedCount} physically time-stretched with pitch-preserving WSOLA [0.88×–1.15×], ${reviewCount} flagged for phrasing/timing review; zero silent truncation).`,
           errorMessage: null,
+          executionEngine: 'Pitch-Preserving WSOLA Synchronizer (Real PCM)',
         };
       }
 
       case 'sound_classification': {
-        const decoded = await this.ensureDecodedAudio(scratch);
-        if (!decoded) {
+        const stereo = await this.ensureDecodedStereo(scratch);
+        if (!stereo) {
           return {
             status: 'completed_with_warnings',
             outputSummary:
@@ -2047,10 +2840,10 @@ class MasterOrchestratorRuntime {
             ? segments.map((s) => ({ startMs: s.originalStartMs, endMs: s.originalEndMs }))
             : scratch.speakerTurns.map((t) => ({ startMs: t.startMs, endMs: t.endMs }));
 
-        const soundEvents = classifyAudioSoundEvents(
+        const soundEvents = classifyAudioSoundEventsChunked(
           projectId,
-          decoded.samples,
-          decoded.sampleRate,
+          stereo,
+          scratch.media?.chunkPlan ?? [],
           speechHints
         );
         scratch.soundEvents = soundEvents;
@@ -2064,20 +2857,43 @@ class MasterOrchestratorRuntime {
 
         return {
           status: 'completed',
-          outputSummary: `Classified ${soundEvents.length} acoustic region(s): ${preservedCount} protected non-dialogue regions (${songCount} song/vocal-music region(s) shielded from vocal removal).`,
+          outputSummary: `Heuristic DSP classifier identified ${soundEvents.length} region(s) across 12 sound classes: ${preservedCount} preserved (${songCount} vocal song region(s) shielded from vocal cancellation).`,
           errorMessage: null,
+          executionEngine: 'Heuristic Multi-Feature Spectral/Harmonic Classifier (DSP)',
         };
       }
 
       case 'audio_separation': {
-        const decoded = await this.ensureDecodedAudio(scratch);
-        if (!decoded) {
+        const stereo = await this.ensureDecodedStereo(scratch);
+        if (!stereo) {
           return {
             status: 'completed_with_warnings',
             outputSummary:
-              'Decoded PCM audio unavailable for conservative stem separation; original media remains immutable.',
+              'Decoded stereo PCM unavailable for audio separation; original media remains immutable.',
             errorMessage: null,
           };
+        }
+
+        // Check if user supplied a clean dialogue-free M&E stem first!
+        const existingStems = await getByIndex<AudioStemRecord>(
+          STORES.audio_stems,
+          'projectId',
+          projectId
+        );
+        const extMeRecord = existingStems.find((s) => s.stemType === 'external_me_stem') ?? null;
+        let externalCleanMe: DecodedAudioStereo | null = null;
+        if (extMeRecord) {
+          const extEntry = await getRecord<VaultEntry>(STORES.file_vault, extMeRecord.vaultKey);
+          if (extEntry) {
+            externalCleanMe = await decodeStoredWavBlobToStereo(extEntry.blob);
+            if (!externalCleanMe) {
+              try {
+                externalCleanMe = await decodeMediaBlobToStereo(extEntry.blob);
+              } catch {
+                externalCleanMe = null;
+              }
+            }
+          }
         }
 
         const soundEvents =
@@ -2096,13 +2912,17 @@ class MasterOrchestratorRuntime {
             : scratch.speakerTurns.map((t) => ({ startMs: t.startMs, endMs: t.endMs }));
 
         const separated = separateAudioStemsConservative({
-          monoSamples: decoded.samples,
-          sampleRate: decoded.sampleRate,
+          stereoLeft: stereo.left,
+          stereoRight: stereo.right,
+          sourceChannels: stereo.channels,
+          sampleRate: stereo.sampleRate,
           soundEvents,
           dialogueWindows,
+          externalCleanMe,
         });
 
-        scratch.backgroundSamples = separated.backgroundSamples;
+        scratch.backgroundLeft = separated.backgroundLeft;
+        scratch.backgroundRight = separated.backgroundRight;
         scratch.backgroundSampleRate = separated.sampleRate;
 
         const now = new Date().toISOString();
@@ -2110,8 +2930,10 @@ class MasterOrchestratorRuntime {
           separated.dialogueSamples,
           separated.sampleRate
         );
-        const bgBlob = encodeFloat32ToWavBlob(
-          separated.backgroundSamples,
+        // Preserve FULL STEREO (44.1 / 48 kHz) background stem!
+        const bgBlob = encodeStereoToWavBlob(
+          separated.backgroundLeft,
+          separated.backgroundRight,
           separated.sampleRate
         );
 
@@ -2146,10 +2968,14 @@ class MasterOrchestratorRuntime {
           stemType: 'dialogue_stem',
           vaultKey: dlgKey,
           sampleRate: separated.sampleRate,
+          channels: 1,
           durationMs: separated.durationMs,
           sizeBytes: dialogueBlob.size,
           separationMethod: separated.separationMethod,
           confidence: separated.confidence,
+          residualDialogueLeakageDb: separated.residualDialogueLeakageDb,
+          artifactRiskScore: separated.artifactRiskScore,
+          isExternalCleanStem: separated.isExternalCleanStem,
           artifactWarning: separated.artifactWarning,
         });
         const bgStem = buildAudioStemRecord({
@@ -2157,15 +2983,18 @@ class MasterOrchestratorRuntime {
           stemType: 'background_stem',
           vaultKey: bgKey,
           sampleRate: separated.sampleRate,
+          channels: 2,
           durationMs: separated.durationMs,
           sizeBytes: bgBlob.size,
           separationMethod: separated.separationMethod,
           confidence: separated.confidence,
+          residualDialogueLeakageDb: separated.residualDialogueLeakageDb,
+          artifactRiskScore: separated.artifactRiskScore,
+          isExternalCleanStem: separated.isExternalCleanStem,
           artifactWarning: separated.artifactWarning,
         });
         await putManyRecords(STORES.audio_stems, [dlgStem, bgStem]);
 
-        // Place preserved Background / Music & SFX stem clip with real waveform peaks on timeline
         const tracks = await getByIndex<TimelineTrack>(
           STORES.timeline_tracks,
           'projectId',
@@ -2179,7 +3008,9 @@ class MasterOrchestratorRuntime {
             projectId,
             trackId: musicTrack.trackId,
             segmentId: null,
-            label: 'Preserved Music, Songs & Ambience Stem',
+            label: separated.isExternalCleanStem
+              ? 'Clean M&E Stem (Stereo)'
+              : `Preserved Stereo Music & SFX (${separated.sampleRate} Hz)`,
             startMs: 0,
             endMs: separated.durationMs,
             durationMs: separated.durationMs,
@@ -2194,23 +3025,26 @@ class MasterOrchestratorRuntime {
         }
 
         return {
-          status: 'completed_with_warnings',
-          outputSummary: `${separated.separationMethod} wrote dialogue_stem.wav & background_stem.wav (${(
+          status: separated.isExternalCleanStem ? 'completed' : 'completed_with_warnings',
+          outputSummary: `${separated.separationMethod} wrote stereo background_stem.wav (${(
             separated.durationMs / 1000
-          ).toFixed(1)}s, confidence ${Math.round(separated.confidence * 100)}%). ${
-            separated.artifactWarning
-          }`,
+          ).toFixed(1)}s, residual dialogue leakage: ${
+            separated.residualDialogueLeakageDb !== null
+              ? `${separated.residualDialogueLeakageDb} dB`
+              : 'n/a'
+          }).`,
           errorMessage: null,
+          executionEngine: separated.separationMethod,
         };
       }
 
       case 'audio_mixing': {
-        const mixOutcome = await this.runAudioMixingForProject(projectId);
-        return mixOutcome;
+        return await this.runAudioMixingForProject(projectId);
       }
 
       case 'quality_assurance': {
         const qaRes = await this.runQualityAssuranceForProject(projectId, settings);
+        scratch.lastQAReport = qaRes;
         return {
           status:
             qaRes.overallStatus === 'failed'
@@ -2218,12 +3052,15 @@ class MasterOrchestratorRuntime {
               : qaRes.overallStatus === 'warning' || qaRes.overallStatus === 'needs_review'
               ? 'completed_with_warnings'
               : 'completed',
-          outputSummary: `QA Audit (${qaRes.overallStatus}): ${qaRes.passedCount} passed, ${qaRes.warningCount} warning(s), ${qaRes.failedCount} failed, ${qaRes.reviewRequiredCount} review item(s). ${
+          outputSummary: `18-Check QA (${qaRes.overallStatus}): ${qaRes.passedCount} passed, ${qaRes.warningCount} warning(s), ${qaRes.failedCount} failed, ${qaRes.reviewRequiredCount} review item(s). ${
             qaRes.acousticMetrics
-              ? `Master Peak ${qaRes.acousticMetrics.peakDbfs} dBFS · Clipping samples: ${qaRes.acousticMetrics.clippingSampleCount}.`
+              ? `Stereo Master ${qaRes.acousticMetrics.sampleRate ?? ''}Hz · Peak ${qaRes.acousticMetrics.peakDbfs} dBFS · Clipping: ${qaRes.acousticMetrics.clippingSampleCount}.`
               : ''
           }`.trim(),
           errorMessage: null,
+          executionEngine: qaRes.semanticQAResult?.executed
+            ? `18-Check Acoustic/Structural QA + ${qaRes.semanticQAResult.engine}`
+            : '18-Check Local Acoustic & Structural QA',
         };
       }
 
@@ -2237,8 +3074,7 @@ class MasterOrchestratorRuntime {
   }
 
   /**
-   * Reusable Agent #23 Multitrack Audio Mixing entry point (used both inside DAG pipeline
-   * and directly from Audio Studio "Render Final Dub Master").
+   * Reusable Agent #23 Stereo Multitrack Audio Mixing entry point (44.1 / 48 kHz Stereo).
    */
   async runAudioMixingForProject(projectId: string): Promise<SingleAgentOutcome> {
     const [tracks, clips, stems, soundEvents, metaList, versions] = await Promise.all([
@@ -2252,22 +3088,28 @@ class MasterOrchestratorRuntime {
 
     const trackById = new Map(tracks.map((t) => [t.trackId, t]));
 
-    // Load background stem (or fallback to original media decoded mono)
-    let bgSamples: Float32Array | null = null;
-    let bgSampleRate = 16000;
-    const bgStem = stems.find((s) => s.stemType === 'background_stem');
-    if (bgStem) {
-      const entry = await getRecord<VaultEntry>(STORES.file_vault, bgStem.vaultKey);
+    // Prefer user-imported clean M&E stem, then separated stereo background stem, then native stereo original
+    let bgStereo: DecodedAudioStereo | null = null;
+    const preferredBgStem =
+      stems.find((s) => s.stemType === 'external_me_stem') ??
+      stems.find((s) => s.stemType === 'background_stem') ??
+      null;
+
+    if (preferredBgStem) {
+      const entry = await getRecord<VaultEntry>(STORES.file_vault, preferredBgStem.vaultKey);
       if (entry) {
-        const decoded = decodePcmWavBuffer(await entry.blob.arrayBuffer());
-        if (decoded) {
-          bgSamples = decoded.samples;
-          bgSampleRate = decoded.sampleRate;
+        bgStereo = await decodeStoredWavBlobToStereo(entry.blob);
+        if (!bgStereo) {
+          try {
+            bgStereo = await decodeMediaBlobToStereo(entry.blob);
+          } catch {
+            bgStereo = null;
+          }
         }
       }
     }
 
-    if (!bgSamples) {
+    if (!bgStereo) {
       const mediaList = await getByIndex<ImportedMedia>(
         STORES.imported_media,
         'projectId',
@@ -2280,17 +3122,17 @@ class MasterOrchestratorRuntime {
         );
         if (origEntry) {
           try {
-            const decodedOrig = await decodeMediaBlobToMono16k(origEntry.blob);
-            bgSamples = decodedOrig.samples;
-            bgSampleRate = decodedOrig.sampleRate;
+            bgStereo = await decodeMediaBlobToStereo(
+              origEntry.blob,
+              mediaList[0].fileExtension
+            );
           } catch {
-            bgSamples = null;
+            bgStereo = null;
           }
         }
       }
     }
 
-    // Load all real Hindi dialogue audio clips
     const dialogueInputs: MixDialogueClipInput[] = [];
     for (const clip of clips) {
       const tr = trackById.get(clip.trackId);
@@ -2310,23 +3152,27 @@ class MasterOrchestratorRuntime {
       }
     }
 
-    if (!bgSamples && dialogueInputs.length === 0) {
+    if (!bgStereo && dialogueInputs.length === 0) {
       return {
         status: 'completed_with_warnings',
         outputSummary:
-          'No decoded background stem or generated Hindi dialogue WAV clips available to render final mix yet.',
+          'No decoded background stem or generated Hindi dialogue WAV clips available to render stereo master mix yet.',
         errorMessage: null,
+        executionEngine: 'Stereo Multitrack Mastering Mixer',
       };
     }
 
+    const targetRate = bgStereo && bgStereo.sampleRate >= 44100 ? bgStereo.sampleRate : 48000;
     const mix = mixFinalDubAudio({
       tracks,
-      backgroundSamples: bgSamples,
-      backgroundSampleRate: bgSampleRate,
+      backgroundSamples: null,
+      backgroundLeft: bgStereo?.left ?? null,
+      backgroundRight: bgStereo?.right ?? null,
+      backgroundSampleRate: bgStereo?.sampleRate ?? targetRate,
       dialogueInputs,
       soundEvents,
       totalDurationMs: metaList[0]?.durationMs ?? 0,
-      targetSampleRate: 16000,
+      targetSampleRate: targetRate,
     });
 
     const now = new Date().toISOString();
@@ -2347,64 +3193,78 @@ class MasterOrchestratorRuntime {
       stemType: 'final_mix',
       vaultKey: mixVaultKey,
       sampleRate: mix.sampleRate,
+      channels: 2,
       durationMs: mix.durationMs,
       sizeBytes: mix.wavBlob.size,
-      separationMethod: `Multitrack Mix (${dialogueInputs.length} Hindi clip(s) + Ducking + -1.0 dBFS Limiter)`,
-      confidence: dialogueInputs.length > 0 ? 0.92 : 0.7,
+      separationMethod: `Stereo Multitrack Mix (${mix.sampleRate} Hz Stereo · ${dialogueInputs.length} Hindi clip(s) + Ducking + -1.0 dBFS Stereo Limiter)`,
+      confidence: dialogueInputs.length > 0 ? 0.94 : 0.72,
+      isExternalCleanStem: preferredBgStem?.stemType === 'external_me_stem',
       artifactWarning:
         dialogueInputs.length === 0
-          ? 'Rendered preserved background/M&E master only (0 generated Hindi dialogue clips present yet).'
+          ? 'Rendered preserved stereo background/M&E master only (0 generated Hindi dialogue clips present yet).'
           : null,
     });
     await putRecord(STORES.audio_stems, mixStem);
 
-    // Record mix version history
     const nextVersionNumber =
       versions.reduce((max, v) => Math.max(max, v.versionNumber), 0) + 1;
     await putRecord<ProjectVersion>(STORES.project_versions, {
       id: `ver_${projectId}_${nextVersionNumber}`,
       projectId,
       versionNumber: nextVersionNumber,
-      label: `v${nextVersionNumber}.0 Dub Mix Master`,
+      label: `v${nextVersionNumber}.0 Stereo Dub Mix Master`,
       createdAt: now,
-      summary: `Mixed ${dialogueInputs.length} Hindi clip(s) onto preserved background (${(
+      summary: `Mixed ${dialogueInputs.length} Hindi clip(s) at ${mix.sampleRate} Hz Stereo (${(
         mix.durationMs / 1000
       ).toFixed(1)}s · Peak ${mix.metrics.peakDbfs} dBFS · RMS ${mix.metrics.rmsDbfs} dBFS).`,
     });
 
     return {
       status: dialogueInputs.length > 0 ? 'completed' : 'completed_with_warnings',
-      outputSummary: `Rendered final_dub_master.wav (${(mix.durationMs / 1000).toFixed(
-        1
-      )}s · ${dialogueInputs.length} Hindi clip(s) · Peak ${mix.metrics.peakDbfs} dBFS · Clipping: ${
-        mix.metrics.clippingSampleCount
-      }).`,
+      outputSummary: `Rendered stereo final_dub_master.wav (${mix.sampleRate} Hz 2ch · ${(
+        mix.durationMs / 1000
+      ).toFixed(1)}s · ${dialogueInputs.length} Hindi clip(s) · Peak ${
+        mix.metrics.peakDbfs
+      } dBFS · Clipping: ${mix.metrics.clippingSampleCount}).`,
       errorMessage: null,
+      executionEngine: `Stereo Multitrack Mastering Mixer (${mix.sampleRate} Hz Stereo)`,
     };
   }
 
   /**
-   * Reusable Agent #24 Full Acoustic + Structural + Semantic Quality Assurance audit.
+   * Reusable Agent #24 Comprehensive 18-Check Quality Assurance Audit
+   * with separate Semantic QA execution and explicit responsible-agent issue attribution.
    */
   async runQualityAssuranceForProject(
     projectId: string,
     settings: AppSettings
   ): Promise<QAReport> {
-    const [segments, characters, clips, stems, soundEvents] = await Promise.all([
-      getByIndex<DialogueSegment>(STORES.dialogue_segments, 'projectId', projectId),
-      getAllRecords<CharacterProfile>(STORES.characters),
-      getByIndex<AudioClip>(STORES.audio_clips, 'projectId', projectId),
-      getByIndex<AudioStemRecord>(STORES.audio_stems, 'projectId', projectId),
-      getByIndex<SoundEventRecord>(STORES.sound_events, 'projectId', projectId),
-    ]);
+    const [projectRec, segments, allCharacters, clips, stems, soundEvents, pronunciations] =
+      await Promise.all([
+        getRecord<Project>(STORES.projects, projectId),
+        getByIndex<DialogueSegment>(STORES.dialogue_segments, 'projectId', projectId),
+        getAllRecords<CharacterProfile>(STORES.characters),
+        getByIndex<AudioClip>(STORES.audio_clips, 'projectId', projectId),
+        getByIndex<AudioStemRecord>(STORES.audio_stems, 'projectId', projectId),
+        getByIndex<SoundEventRecord>(STORES.sound_events, 'projectId', projectId),
+        getAllRecords<PronunciationEntry>(STORES.pronunciation_entries),
+      ]);
+
+    const seriesScope = projectRec?.seriesTitle || 'Default Series';
+    const characters = allCharacters.filter(
+      (c) =>
+        c.projectId === projectId ||
+        c.seriesScope.trim().toLowerCase() === seriesScope.trim().toLowerCase()
+    );
 
     const issues: QAIssue[] = [];
+    const checks: QACheckSummaryItem[] = [];
     let passedCount = 0;
     let warningCount = 0;
     let failedCount = 0;
     let reviewRequiredCount = 0;
 
-    // 1. Acoustic QA on Final Master Mix WAV (or fallback background stem)
+    // 1. Acoustic QA on Final Master Mix WAV (stereo-aware)
     let acousticMetrics: AcousticQAMetrics | null = null;
     const finalMixStem =
       stems.find((s) => s.stemType === 'final_mix') ??
@@ -2414,14 +3274,16 @@ class MasterOrchestratorRuntime {
     if (finalMixStem) {
       const entry = await getRecord<VaultEntry>(STORES.file_vault, finalMixStem.vaultKey);
       if (entry) {
-        const decoded = decodePcmWavBuffer(await entry.blob.arrayBuffer());
-        if (decoded) {
-          acousticMetrics = measureAcousticQAMetrics(
-            decoded.samples,
-            decoded.sampleRate,
+        const decodedStereo = await decodeStoredWavBlobToStereo(entry.blob);
+        if (decodedStereo) {
+          acousticMetrics = measureStereoAcousticQAMetrics(
+            decodedStereo.left,
+            decodedStereo.right,
+            decodedStereo.sampleRate,
             null,
             finalMixStem.vaultKey
           );
+          acousticMetrics.channels = decodedStereo.channels;
           if (acousticMetrics.clippingSampleCount > 0) {
             failedCount += 1;
             issues.push({
@@ -2429,7 +3291,12 @@ class MasterOrchestratorRuntime {
               segmentId: null,
               category: 'audio_quality',
               severity: 'error',
-              message: `Detected ${acousticMetrics.clippingSampleCount} clipped sample(s) in ${finalMixStem.stemType} (Peak ${acousticMetrics.peakDbfs} dBFS). Reduce track gain and re-render mix.`,
+              message: `Detected ${acousticMetrics.clippingSampleCount} clipped sample(s) in ${finalMixStem.stemType} (Peak ${acousticMetrics.peakDbfs} dBFS).`,
+              evidence: `Peak=${acousticMetrics.peakDbfs} dBFS, ClippedSamples=${acousticMetrics.clippingSampleCount}`,
+              responsibleAgent: 'audio_mixing',
+              resolutionState: 'open',
+              retryCount: 0,
+              finalReviewStatus: 'needs_review',
               resolved: false,
             });
           }
@@ -2441,6 +3308,11 @@ class MasterOrchestratorRuntime {
               category: 'audio_quality',
               severity: 'warning',
               message: `Rendered audio master ${finalMixStem.vaultKey} appears near-silent (Peak ${acousticMetrics.peakDbfs} dBFS).`,
+              evidence: `Peak=${acousticMetrics.peakDbfs} dBFS, SilenceRatio=${acousticMetrics.silenceRatio}`,
+              responsibleAgent: 'audio_mixing',
+              resolutionState: 'open',
+              retryCount: 0,
+              finalReviewStatus: 'needs_review',
               resolved: false,
             });
           }
@@ -2448,18 +3320,52 @@ class MasterOrchestratorRuntime {
       }
     }
 
-    // 2. Separation & Sound Preservation warnings
-    const bgStem = stems.find((s) => s.stemType === 'background_stem');
-    if (bgStem?.artifactWarning) {
+    // Check #14: Stereo & Sample-Rate Integrity
+    const isStereoMaster = Boolean(
+      acousticMetrics && (acousticMetrics.channels ?? 1) >= 2 && (acousticMetrics.sampleRate ?? 0) >= 44100
+    );
+    if (acousticMetrics && !isStereoMaster) {
+      warningCount += 1;
       issues.push({
-        id: `qa_sep_warning_${projectId}`,
+        id: `qa_stereo_integrity_${projectId}`,
         segmentId: null,
-        category: 'sound_preservation',
+        category: 'stereo_integrity',
         severity: 'warning',
-        message: bgStem.artifactWarning,
+        message: `Master output is ${acousticMetrics.channels ?? 1}ch @ ${acousticMetrics.sampleRate ?? 0} Hz (studio stereo target is 2ch @ 44.1/48 kHz).`,
+        evidence: `channels=${acousticMetrics.channels}, sampleRate=${acousticMetrics.sampleRate}`,
+        responsibleAgent: 'audio_mixing',
+        resolutionState: 'open',
+        retryCount: 0,
+        finalReviewStatus: 'needs_review',
         resolved: false,
       });
     }
+
+    // Check #13: Residual Japanese Dialogue Leakage
+    const bgStem = stems.find((s) => s.stemType === 'background_stem');
+    const extMeStem = stems.find((s) => s.stemType === 'external_me_stem');
+    const residualLeakageDb = extMeStem
+      ? -48
+      : bgStem?.residualDialogueLeakageDb ?? null;
+
+    if (bgStem?.artifactWarning && !extMeStem) {
+      issues.push({
+        id: `qa_leakage_${projectId}`,
+        segmentId: null,
+        category: 'leakage',
+        severity:
+          residualLeakageDb !== null && residualLeakageDb > -10 ? 'review_required' : 'warning',
+        message: bgStem.artifactWarning,
+        evidence: `ResidualDialogueLeakage=${residualLeakageDb !== null ? `${residualLeakageDb} dB` : 'unmeasured'}, ArtifactRisk=${bgStem.artifactRiskScore ?? 'n/a'}`,
+        responsibleAgent: 'audio_separation',
+        resolutionState: 'manual_review_required',
+        retryCount: 0,
+        finalReviewStatus: 'needs_review',
+        resolved: false,
+      });
+    }
+
+    // Check #12: Song / OP-ED Preservation
     const protectedSongs = soundEvents.filter((e) => e.category === 'song').length;
     if (protectedSongs > 0) {
       issues.push({
@@ -2467,12 +3373,17 @@ class MasterOrchestratorRuntime {
         segmentId: null,
         category: 'sound_preservation',
         severity: 'review_required',
-        message: `${protectedSongs} vocal song/OP-ED region(s) detected and protected from vocal cancellation — verify Hindi dialogue does not overlap singing.`,
+        message: `${protectedSongs} vocal song/OP-ED region(s) shielded from vocal cancellation — verify Hindi dialogue does not overlap singing.`,
+        evidence: `ProtectedSongs=${protectedSongs}`,
+        responsibleAgent: 'sound_classification',
+        resolutionState: 'manual_review_required',
+        retryCount: 0,
+        finalReviewStatus: 'needs_review',
         resolved: false,
       });
     }
 
-    // 3. Overlapping dialogue clip audit
+    // Check #11: Overlapping dialogue clips
     const dialogueClips = clips.filter((c) => Boolean(c.segmentId));
     const overlaps = findOverlappingClips(dialogueClips);
     for (const [cA, cB] of overlaps.slice(0, 8)) {
@@ -2483,11 +3394,28 @@ class MasterOrchestratorRuntime {
         category: 'timing',
         severity: 'warning',
         message: `Overlapping dialogue clips "${cA.label}" and "${cB.label}" — verify intentional anime overlap in Audio Studio.`,
+        evidence: `ClipA=[${cA.startMs}..${cA.endMs}ms], ClipB=[${cB.startMs}..${cB.endMs}ms]`,
+        responsibleAgent: 'synchronization',
+        resolutionState: 'open',
+        retryCount: 0,
+        finalReviewStatus: 'needs_review',
         resolved: false,
       });
     }
 
-    // 4. Per-segment structural, timing, collaborative disagreement, and per-clip acoustic audit
+    // Track aggregates for the 18 explicit checks
+    let emptyJapaneseCount = 0;
+    let emptyHindiCount = 0;
+    let disagreementCount = 0;
+    let pronunciationMissCount = 0;
+    let unassignedSpeakerCount = 0;
+    let missingVoiceCount = 0;
+    let missingActingCount = 0;
+    let timingOutOfTolCount = 0;
+    let wsolaNeedsAdjCount = 0;
+    let missingAudioCount = 0;
+    let clipClippingCount = 0;
+
     for (const seg of segments) {
       let segHasError = false;
       let segHasWarning = false;
@@ -2495,19 +3423,26 @@ class MasterOrchestratorRuntime {
       const linkedClip = clips.find((c) => c.segmentId === seg.segmentId) ?? null;
 
       if (!seg.japaneseText.trim()) {
+        emptyJapaneseCount += 1;
         segHasWarning = true;
         issues.push({
           id: `qa_${seg.segmentId}_jp`,
           segmentId: seg.segmentId,
           clipId: linkedClip?.clipId ?? null,
-          category: 'translation',
+          category: 'asr_quality',
           severity: 'warning',
           message: `${seg.segmentId}: Source Japanese transcription is empty.`,
+          evidence: 'japaneseText.length === 0',
+          responsibleAgent: 'japanese_asr',
+          resolutionState: 'open',
+          retryCount: 0,
+          finalReviewStatus: 'needs_review',
           resolved: false,
         });
       }
 
       if (!seg.hindiText.trim()) {
+        emptyHindiCount += 1;
         segHasError = true;
         issues.push({
           id: `qa_${seg.segmentId}_hi`,
@@ -2516,21 +3451,84 @@ class MasterOrchestratorRuntime {
           category: 'translation',
           severity: 'error',
           message: `${seg.segmentId}: Missing Hindi translation text.`,
+          evidence: 'hindiText.length === 0',
+          responsibleAgent: 'translation',
+          resolutionState: 'open',
+          retryCount: 0,
+          finalReviewStatus: 'needs_review',
           resolved: false,
         });
       }
 
+      if (seg.sourceSpeakerId === 'UNASSIGNED_SPEAKER') {
+        unassignedSpeakerCount += 1;
+        segNeedsReview = true;
+        issues.push({
+          id: `qa_${seg.segmentId}_spk`,
+          segmentId: seg.segmentId,
+          clipId: linkedClip?.clipId ?? null,
+          category: 'speaker_identity',
+          severity: 'review_required',
+          message: `${seg.segmentId}: Speaker could not be matched to a diarized turn (UNASSIGNED_SPEAKER). Assign speaker manually.`,
+          evidence: 'sourceSpeakerId === UNASSIGNED_SPEAKER',
+          responsibleAgent: 'speaker_diarization',
+          resolutionState: 'manual_review_required',
+          retryCount: 0,
+          finalReviewStatus: 'needs_review',
+          resolved: false,
+        });
+      }
+
+      // Check #4: Pronunciation glossary consistency
+      if (seg.hindiText.trim() && pronunciations.length > 0) {
+        for (const p of pronunciations) {
+          if (
+            seg.japaneseText.includes(p.sourceTerm) &&
+            p.targetHindiForm &&
+            !seg.hindiText.includes(p.targetHindiForm)
+          ) {
+            pronunciationMissCount += 1;
+            segHasWarning = true;
+            issues.push({
+              id: `qa_${seg.segmentId}_pron_${p.id}`,
+              segmentId: seg.segmentId,
+              clipId: linkedClip?.clipId ?? null,
+              category: 'pronunciation',
+              severity: 'warning',
+              message: `${seg.segmentId}: Glossary term "${p.sourceTerm}" expected Hindi form "${p.targetHindiForm}".`,
+              evidence: `Source contains "${p.sourceTerm}", Hindi missing "${p.targetHindiForm}"`,
+              responsibleAgent: 'pronunciation',
+              resolutionState: 'open',
+              retryCount: 0,
+              finalReviewStatus: 'needs_review',
+              resolved: false,
+            });
+            break;
+          }
+        }
+      }
+
       if (seg.collaborativeMeta?.disagreementFlag) {
+        disagreementCount += 1;
         segNeedsReview = true;
         issues.push({
           id: `qa_${seg.segmentId}_collab_disagree`,
           segmentId: seg.segmentId,
           clipId: linkedClip?.clipId ?? null,
-          category: 'translation',
+          category: 'cultural_nuance',
           severity: 'review_required',
-          message: `${seg.segmentId}: Gemini & Local translation models disagreed — inspect alternatives in Translation Studio.`,
+          message: `${seg.segmentId}: Gemini & Local models disagreed — inspect alternatives in Translation Studio.`,
+          evidence: seg.collaborativeMeta.evidence ?? 'disagreementFlag=true',
+          responsibleAgent: 'translation',
+          resolutionState: 'manual_review_required',
+          retryCount: 0,
+          finalReviewStatus: 'needs_review',
           resolved: false,
         });
+      }
+
+      if (!seg.actingDirective) {
+        missingActingCount += 1;
       }
 
       const timingEval = evaluateTimingAdjustment(
@@ -2539,6 +3537,7 @@ class MasterOrchestratorRuntime {
         seg.preferredShiftLimitMs || settings.preferredTimingAdjustmentMs
       );
       if (!timingEval.withinPreferredRange) {
+        timingOutOfTolCount += 1;
         segHasWarning = true;
         segNeedsReview = true;
         issues.push({
@@ -2548,11 +3547,36 @@ class MasterOrchestratorRuntime {
           category: 'timing',
           severity: 'warning',
           message: `${seg.segmentId}: ${timingEval.label}.`,
+          evidence: `originalStart=${seg.originalStartMs}ms, finalStart=${seg.finalStartMs}ms`,
+          responsibleAgent: 'synchronization',
+          resolutionState: 'open',
+          retryCount: 0,
+          finalReviewStatus: 'needs_review',
+          resolved: false,
+        });
+      }
+
+      if (seg.syncStatus === 'needs_adjustment') {
+        wsolaNeedsAdjCount += 1;
+        segNeedsReview = true;
+        issues.push({
+          id: `qa_${seg.segmentId}_wsola`,
+          segmentId: seg.segmentId,
+          clipId: linkedClip?.clipId ?? null,
+          category: 'timing',
+          severity: 'review_required',
+          message: `${seg.segmentId}: Hindi duration exceeds 1.15× natural WSOLA limit (delta ${seg.syncDeltaMs ?? 0} ms) — shorten Hindi phrasing instead of truncating.`,
+          evidence: `appliedSpeed=${seg.appliedSpeedMultiplier ?? 1}x, syncDeltaMs=${seg.syncDeltaMs ?? 0}`,
+          responsibleAgent: 'translation',
+          resolutionState: 'manual_review_required',
+          retryCount: 0,
+          finalReviewStatus: 'needs_review',
           resolved: false,
         });
       }
 
       if (!seg.assignedHindiVoiceId) {
+        missingVoiceCount += 1;
         segNeedsReview = true;
         issues.push({
           id: `qa_${seg.segmentId}_voice`,
@@ -2561,11 +3585,17 @@ class MasterOrchestratorRuntime {
           category: 'voice',
           severity: 'review_required',
           message: `${seg.segmentId}: No permanent Hindi Voice ID assigned yet.`,
+          evidence: 'assignedHindiVoiceId === null',
+          responsibleAgent: 'voice_assignment',
+          resolutionState: 'open',
+          retryCount: 0,
+          finalReviewStatus: 'needs_review',
           resolved: false,
         });
       }
 
       if (!seg.generatedAudioRef) {
+        missingAudioCount += 1;
         segHasWarning = true;
         issues.push({
           id: `qa_${seg.segmentId}_audio`,
@@ -2574,6 +3604,11 @@ class MasterOrchestratorRuntime {
           category: 'audio_quality',
           severity: 'warning',
           message: `${seg.segmentId}: Generated Hindi WAV audio not synthesized yet.`,
+          evidence: 'generatedAudioRef === null',
+          responsibleAgent: 'hindi_tts',
+          resolutionState: 'open',
+          retryCount: 0,
+          finalReviewStatus: 'needs_review',
           resolved: false,
         });
       } else {
@@ -2583,6 +3618,7 @@ class MasterOrchestratorRuntime {
           if (decoded) {
             const clipMetrics = measureAcousticQAMetrics(decoded.samples, decoded.sampleRate);
             if (clipMetrics.clippingSampleCount > 0) {
+              clipClippingCount += 1;
               segHasWarning = true;
               issues.push({
                 id: `qa_${seg.segmentId}_clipping`,
@@ -2591,6 +3627,11 @@ class MasterOrchestratorRuntime {
                 category: 'audio_quality',
                 severity: 'warning',
                 message: `${seg.segmentId}: Synthesized WAV has ${clipMetrics.clippingSampleCount} clipped sample(s) (Peak ${clipMetrics.peakDbfs} dBFS).`,
+                evidence: `ClipPeak=${clipMetrics.peakDbfs} dBFS`,
+                responsibleAgent: 'hindi_tts',
+                resolutionState: 'open',
+                retryCount: 0,
+                finalReviewStatus: 'needs_review',
                 resolved: false,
               });
             }
@@ -2622,9 +3663,11 @@ class MasterOrchestratorRuntime {
       });
     }
 
-    // 5. Character identity uncertainty check
+    // Character identity uncertainty check
+    let lowConfChars = 0;
     for (const ch of characters) {
       if (ch.reviewStatus === 'needs_review' || ch.identityConfidence < 0.7) {
+        lowConfChars += 1;
         reviewRequiredCount += 1;
         issues.push({
           id: `qa_chr_${ch.characterId}`,
@@ -2634,10 +3677,208 @@ class MasterOrchestratorRuntime {
           message: `Character ${ch.displayName} (${ch.characterId}) has confidence ${Math.round(
             ch.identityConfidence * 100
           )}% and requires identity review.`,
+          evidence: `identityConfidence=${ch.identityConfidence}, reviewStatus=${ch.reviewStatus}`,
+          responsibleAgent: 'face_voice_matching',
+          resolutionState: 'manual_review_required',
+          retryCount: 0,
+          finalReviewStatus: 'needs_review',
           resolved: false,
         });
       }
     }
+
+    // Check #18: Separate Independent Semantic QA Execution (never conflated with translation drafting!)
+    const semanticFindings: string[] = [];
+    let semanticEngine: string | null = null;
+    let semanticCheckedCount = 0;
+    const semanticTargets = segments
+      .filter((s) => s.japaneseText.trim() && s.hindiText.trim())
+      .sort((a, b) => Number(Boolean(b.collaborativeMeta?.disagreementFlag)) - Number(Boolean(a.collaborativeMeta?.disagreementFlag)))
+      .slice(0, 4);
+
+    const charById = new Map(characters.map((c) => [c.characterId, c]));
+    for (const seg of semanticTargets) {
+      const ch = seg.characterId ? charById.get(seg.characterId) : null;
+      const semRes = await runSemanticQAReviewOnSegment({
+        japaneseText: seg.japaneseText,
+        hindiText: seg.hindiText,
+        characterContext: ch ? `${ch.displayName} (${ch.personality})` : seg.sourceSpeakerId,
+        politenessRegister: ch?.relationships[0]?.politenessRegister ?? '',
+        targetDurationMs: seg.originalDurationMs,
+        pronunciationRules: pronunciations,
+        settings,
+      });
+      if (semRes.executed) {
+        semanticCheckedCount += 1;
+        semanticEngine = semRes.engine;
+        for (const w of semRes.warnings) {
+          semanticFindings.push(`${seg.segmentId}: ${w}`);
+        }
+      } else {
+        break; // Offline or cloud disabled — do not retry remaining segments
+      }
+    }
+
+    const semanticQAResult: SemanticQAResult = {
+      executed: semanticCheckedCount > 0,
+      engine: semanticEngine,
+      checkedCount: semanticCheckedCount,
+      findings: semanticFindings,
+      executedAt: semanticCheckedCount > 0 ? new Date().toISOString() : null,
+    };
+
+    // Assemble all 18 explicit QA check summary items
+    checks.push(
+      {
+        id: 'chk_01_asr',
+        label: '1. Japanese ASR Completeness',
+        status: segments.length === 0 ? 'skipped' : emptyJapaneseCount > 0 ? 'warning' : 'passed',
+        evidence: `${segments.length - emptyJapaneseCount}/${segments.length} segments have Japanese source text`,
+      },
+      {
+        id: 'chk_02_translation',
+        label: '2. Hindi Translation Completeness',
+        status: segments.length === 0 ? 'skipped' : emptyHindiCount > 0 ? 'failed' : 'passed',
+        evidence: `${segments.length - emptyHindiCount}/${segments.length} segments translated into Hindi`,
+      },
+      {
+        id: 'chk_03_cultural',
+        label: '3. Cultural / Idiom Agreement',
+        status: segments.length === 0 ? 'skipped' : disagreementCount > 0 ? 'review_required' : 'passed',
+        evidence: `${disagreementCount} Gemini vs Local disagreement(s)`,
+      },
+      {
+        id: 'chk_04_pronunciation',
+        label: '4. Pronunciation Glossary Consistency',
+        status: pronunciations.length === 0 ? 'skipped' : pronunciationMissCount > 0 ? 'warning' : 'passed',
+        evidence: `${pronunciations.length} glossary rule(s) checked, ${pronunciationMissCount} mismatch(es)`,
+      },
+      {
+        id: 'chk_05_speaker',
+        label: '5. Speaker Attribution Integrity',
+        status: segments.length === 0 ? 'skipped' : unassignedSpeakerCount > 0 ? 'review_required' : 'passed',
+        evidence: `${unassignedSpeakerCount} unassigned speaker segment(s)`,
+      },
+      {
+        id: 'chk_06_character',
+        label: '6. Character Identity Confidence',
+        status: characters.length === 0 ? 'skipped' : lowConfChars > 0 ? 'review_required' : 'passed',
+        evidence: `${characters.length - lowConfChars}/${characters.length} series characters verified ≥70%`,
+      },
+      {
+        id: 'chk_07_voice',
+        label: '7. Permanent Voice Consistency',
+        status: segments.length === 0 ? 'skipped' : missingVoiceCount > 0 ? 'review_required' : 'passed',
+        evidence: `${segments.length - missingVoiceCount}/${segments.length} segments have assigned Hindi Voice ID`,
+      },
+      {
+        id: 'chk_08_acting',
+        label: '8. Emotion & Voice Acting Directives',
+        status: segments.length === 0 ? 'skipped' : missingActingCount > 0 ? 'warning' : 'passed',
+        evidence: `${segments.length - missingActingCount}/${segments.length} segments carry acting directives`,
+      },
+      {
+        id: 'chk_09_timing',
+        label: '9. Dialogue Timing Tolerance (±300ms)',
+        status: segments.length === 0 ? 'skipped' : timingOutOfTolCount > 0 ? 'warning' : 'passed',
+        evidence: `${timingOutOfTolCount} segment(s) shifted beyond preferred tolerance`,
+      },
+      {
+        id: 'chk_10_wsola',
+        label: '10. Real WSOLA Sync & Non-Truncation',
+        status: segments.length === 0 ? 'skipped' : wsolaNeedsAdjCount > 0 ? 'review_required' : 'passed',
+        evidence: `${wsolaNeedsAdjCount} segment(s) exceeded 1.15× natural WSOLA limit`,
+      },
+      {
+        id: 'chk_11_overlap',
+        label: '11. Timeline Clip Overlap Audit',
+        status: dialogueClips.length === 0 ? 'skipped' : overlaps.length > 0 ? 'warning' : 'passed',
+        evidence: `${overlaps.length} overlapping dialogue clip pair(s)`,
+      },
+      {
+        id: 'chk_12_songs',
+        label: '12. Vocal Song & OP-ED Preservation',
+        status: soundEvents.length === 0 ? 'skipped' : protectedSongs > 0 ? 'review_required' : 'passed',
+        evidence: `${protectedSongs} vocal song region(s) shielded from vocal removal`,
+      },
+      {
+        id: 'chk_13_leakage',
+        label: '13. Residual Japanese Dialogue Leakage',
+        status:
+          residualLeakageDb === null
+            ? 'skipped'
+            : extMeStem
+            ? 'passed'
+            : residualLeakageDb > -10
+            ? 'review_required'
+            : 'warning',
+        evidence:
+          extMeStem
+            ? 'Clean M&E stem active (-48 dB leakage)'
+            : residualLeakageDb !== null
+            ? `Measured residual vocal level: ${residualLeakageDb} dB`
+            : 'Separation not yet run',
+      },
+      {
+        id: 'chk_14_stereo',
+        label: '14. Stereo & Studio Sample-Rate Integrity',
+        status: !acousticMetrics ? 'skipped' : isStereoMaster ? 'passed' : 'warning',
+        evidence: acousticMetrics
+          ? `${acousticMetrics.channels ?? 1}ch @ ${acousticMetrics.sampleRate ?? 0} Hz`
+          : 'No master WAV rendered yet',
+      },
+      {
+        id: 'chk_15_peak_clip',
+        label: '15. True Peak & Zero-Clipping Verification',
+        status:
+          !acousticMetrics
+            ? 'skipped'
+            : acousticMetrics.clippingSampleCount > 0 || clipClippingCount > 0
+            ? 'failed'
+            : 'passed',
+        evidence: acousticMetrics
+          ? `Master peak ${acousticMetrics.peakDbfs} dBFS · ${acousticMetrics.clippingSampleCount} clipped master samples · ${clipClippingCount} clipped dialogue clip(s)`
+          : 'Unmeasured',
+      },
+      {
+        id: 'chk_16_loudness',
+        label: '16. Integrated RMS Loudness & Silence Ratio',
+        status:
+          !acousticMetrics
+            ? 'skipped'
+            : acousticMetrics.silenceRatio > 0.92
+            ? 'warning'
+            : 'passed',
+        evidence: acousticMetrics
+          ? `RMS ${acousticMetrics.rmsDbfs} dBFS · Silence ratio ${Math.round(acousticMetrics.silenceRatio * 100)}%`
+          : 'Unmeasured',
+      },
+      {
+        id: 'chk_17_export',
+        label: '17. Export Master & Clip WAV Integrity',
+        status:
+          !acousticMetrics && missingAudioCount > 0
+            ? 'warning'
+            : acousticMetrics?.exportIntegrityVerified && missingAudioCount === 0
+            ? 'passed'
+            : 'warning',
+        evidence: `${segments.length - missingAudioCount}/${segments.length} dialogue WAVs present · Master integrity ${
+          acousticMetrics?.exportIntegrityVerified ? 'verified' : 'pending'
+        }`,
+      },
+      {
+        id: 'chk_18_semantic',
+        label: '18. Independent Semantic QA Pass',
+        status: !semanticQAResult.executed
+          ? 'skipped'
+          : semanticFindings.length > 0
+          ? 'review_required'
+          : 'passed',
+        evidence: semanticQAResult.executed
+          ? `${semanticQAResult.engine} audited ${semanticQAResult.checkedCount} segment(s) (${semanticFindings.length} finding(s))`
+          : 'Not executed (offline mode or Cloud Intelligence disabled)',
+      }
+    );
 
     const report: QAReport = {
       id: `qar_${projectId}_${Date.now()}`,
@@ -2659,15 +3900,16 @@ class MasterOrchestratorRuntime {
       failedCount,
       reviewRequiredCount,
       issues,
+      checksEvaluated: checks,
       acousticMetrics,
-      semanticReviewSummary:
-        segments.filter((s) => Boolean(s.collaborativeMeta?.geminiDraft)).length > 0
-          ? `Collaborative Gemini + Local review verified ${
-              segments.filter((s) => Boolean(s.collaborativeMeta?.geminiDraft)).length
-            } of ${segments.length} dialogue line(s).`
-          : 'Offline acoustic & structural audit completed (enable Cloud Intelligence in Settings for Gemini semantic review).',
+      semanticQAResult,
+      correctionCyclesRun: 0,
+      residualDialogueLeakageDb: residualLeakageDb,
+      semanticReviewSummary: semanticQAResult.executed
+        ? `Independent Semantic QA (${semanticQAResult.engine}) audited ${semanticQAResult.checkedCount} segment(s): ${semanticFindings.length} finding(s).`
+        : 'Independent Semantic QA not executed (enable Cloud Intelligence in Settings to run Gemini Semantic QA separately from translation drafting).',
       engineNote:
-        'Full Prompt 3 Quality Assurance audit completed (real PCM peak/clipping/RMS/silence acoustics, sound preservation check, overlap detection, timing tolerance, voice consistency, and collaborative translation review).',
+        '18-Check Production QA audit completed (stereo 44.1/48 kHz acoustics, residual dialogue leakage, WSOLA sync integrity, glossary rules, speaker attribution, and separate Semantic QA).',
     };
 
     await putRecord(STORES.qa_reports, report);

@@ -95,7 +95,7 @@ test('separateAudioStemsConservative preserves protected song regions and report
   assert.equal(stems.dialogueSamples.length, mono.length);
   assert.equal(stems.backgroundSamples.length, mono.length);
   assert.equal(stems.durationMs, 1500);
-  assert.ok(stems.artifactWarning.length > 20);
+  assert.ok((stems.artifactWarning ?? '').length > 20);
 
   // Inside the protected song window (1.1s..1.4s), background must closely match original mono
   let maxSongDiff = 0;
@@ -299,4 +299,85 @@ test('classifyDialogueComplexity separates simple greetings from idiomatic or ti
     classifyDialogueComplexity('やっぱり先輩には敵わないよ、冗談じゃない！', 2200),
     'complex'
   );
+});
+
+test('separateAudioStemsConservative supports stereo Mid-Side cancellation, external clean M&E stems, and leakage metering', () => {
+  const sr = 48000;
+  // Center-panned dialogue (identical L & R) + stereo wide music (opposite phase L/R)
+  const voiceCenter = makeSine(800, 1.0, sr, 0.4);
+  const stereoWide = makeSine(220, 1.0, sr, 0.3);
+  const left = new Float32Array(sr);
+  const right = new Float32Array(sr);
+  for (let i = 0; i < sr; i += 1) {
+    left[i] = voiceCenter[i] + stereoWide[i];
+    right[i] = voiceCenter[i] - stereoWide[i];
+  }
+
+  const stereoSep = separateAudioStemsConservative({
+    stereoLeft: left,
+    stereoRight: right,
+    sampleRate: sr,
+    soundEvents: [],
+    dialogueWindows: [{ startMs: 100, endMs: 900 }],
+  });
+  assert.equal(stereoSep.channels, 2);
+  assert.equal(stereoSep.sampleRate, 48000);
+  assert.equal(stereoSep.isExternalCleanStem, false);
+  assert.equal(typeof stereoSep.residualDialogueLeakageDb, 'number');
+  assert.ok(stereoSep.artifactRiskScore >= 0 && stereoSep.artifactRiskScore <= 1);
+
+  // External Clean M&E stem path bypasses destructive DSP removal cleanly
+  const cleanMe = separateAudioStemsConservative({
+    stereoLeft: left,
+    stereoRight: right,
+    sampleRate: sr,
+    externalCleanMe: { left: stereoWide, right: stereoWide, sampleRate: sr, channels: 2, durationMs: 1000 },
+    soundEvents: [],
+    dialogueWindows: [{ startMs: 100, endMs: 900 }],
+  });
+  assert.equal(cleanMe.isExternalCleanStem, true);
+  assert.equal(cleanMe.residualDialogueLeakageDb, -48);
+  assert.ok(cleanMe.artifactRiskScore <= 0.05);
+});
+
+test('buildSrtSubtitles sorts Japanese by originalStartMs and Hindi by finalStartMs with sequential numbering', () => {
+  const segA: DialogueSegment = {
+    segmentId: 'SEG-A',
+    projectId: 'prj_1',
+    sourceSpeakerId: 'SPK_01',
+    characterId: null,
+    originalStartMs: 3000,
+    originalEndMs: 4500,
+    originalDurationMs: 1500,
+    japaneseText: '二番目',
+    hindiText: 'पहले आ गया',
+    emotion: { primaryEmotion: 'Calm', intensity: 0.4, deliveryNotes: '', source: 'manual' },
+    assignedHindiVoiceId: null,
+    generatedAudioRef: null,
+    actualGeneratedDurationMs: null,
+    finalStartMs: 500, // deliberately earlier in Hindi timeline
+    finalEndMs: 1800,
+    preferredShiftLimitMs: 300,
+    overlapGroupId: null,
+    syncStatus: 'in_tolerance',
+    qaStatus: 'passed',
+    reviewStatus: 'approved',
+    updatedAt: '2026-11-23T00:00:00.000Z',
+  };
+  const segB: DialogueSegment = {
+    ...segA,
+    segmentId: 'SEG-B',
+    originalStartMs: 1000,
+    originalEndMs: 2500,
+    japaneseText: '一番目',
+    hindiText: 'बाद में आया',
+    finalStartMs: 2600,
+    finalEndMs: 4000,
+  };
+
+  const jaSrt = buildSrtSubtitles([segA, segB], 'ja');
+  assert.ok(jaSrt.indexOf('一番目') < jaSrt.indexOf('二番目'), 'Japanese SRT must sort by originalStartMs');
+
+  const hiSrt = buildSrtSubtitles([segA, segB], 'hi');
+  assert.ok(hiSrt.indexOf('पहले आ गया') < hiSrt.indexOf('बाद में आया'), 'Hindi SRT must sort by finalStartMs');
 });

@@ -1,7 +1,15 @@
-import type { VoiceCharacteristics } from '../../types/domain';
+import type { ChunkDefinition, VoiceCharacteristics } from '../../types/domain';
 
 export interface DecodedAudioMono {
   samples: Float32Array;
+  sampleRate: number;
+  durationMs: number;
+}
+
+export interface DecodedAudioStereo {
+  left: Float32Array;
+  right: Float32Array;
+  channels: number; // original source channels (1 or 2+)
   sampleRate: number;
   durationMs: number;
 }
@@ -78,9 +86,69 @@ export function encodeFloat32ToWavBlob(
 }
 
 /**
- * Decodes a 16-bit PCM RIFF/WAV ArrayBuffer deterministically without AudioContext resampling.
+ * Encodes true 2-channel stereo Float32Array L/R PCM samples [-1, 1] into a standard
+ * 16-bit interleaved stereo RIFF/WAV ArrayBuffer (preserving 44.1 / 48 kHz studio quality).
  */
-export function decodePcmWavBuffer(buffer: ArrayBuffer): DecodedAudioMono | null {
+export function encodeStereoToWavBuffer(
+  left: Float32Array,
+  right: Float32Array,
+  sampleRate: number
+): ArrayBuffer {
+  const frameCount = Math.min(left.length, right.length);
+  const numChannels = 2;
+  const bitsPerSample = 16;
+  const byteRate = sampleRate * numChannels * (bitsPerSample / 8);
+  const blockAlign = numChannels * (bitsPerSample / 8);
+  const dataSize = frameCount * numChannels * 2;
+  const buffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buffer);
+
+  const writeStr = (offset: number, str: string) => {
+    for (let i = 0; i < str.length; i += 1) {
+      view.setUint8(offset + i, str.charCodeAt(i));
+    }
+  };
+
+  writeStr(0, 'RIFF');
+  view.setUint32(4, 36 + dataSize, true);
+  writeStr(8, 'WAVE');
+  writeStr(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, numChannels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, byteRate, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, bitsPerSample, true);
+  writeStr(36, 'data');
+  view.setUint32(40, dataSize, true);
+
+  let offset = 44;
+  for (let i = 0; i < frameCount; i += 1) {
+    const l = Math.max(-1, Math.min(1, left[i]));
+    const r = Math.max(-1, Math.min(1, right[i]));
+    view.setInt16(offset, l < 0 ? Math.round(l * 0x8000) : Math.round(l * 0x7fff), true);
+    view.setInt16(offset + 2, r < 0 ? Math.round(r * 0x8000) : Math.round(r * 0x7fff), true);
+    offset += 4;
+  }
+
+  return buffer;
+}
+
+export function encodeStereoToWavBlob(
+  left: Float32Array,
+  right: Float32Array,
+  sampleRate: number
+): Blob {
+  return new Blob([encodeStereoToWavBuffer(left, right, sampleRate)], {
+    type: 'audio/wav',
+  });
+}
+
+/**
+ * Decodes a 16-bit PCM RIFF/WAV ArrayBuffer preserving stereo L/R channels & native sample rate.
+ */
+export function decodePcmWavBufferStereo(buffer: ArrayBuffer): DecodedAudioStereo | null {
   if (buffer.byteLength < 44) return null;
   const view = new DataView(buffer);
   const riff = String.fromCharCode(
@@ -98,7 +166,7 @@ export function decodePcmWavBuffer(buffer: ArrayBuffer): DecodedAudioMono | null
   if (riff !== 'RIFF' || wave !== 'WAVE') return null;
 
   let offset = 12;
-  let sampleRate = 16000;
+  let sampleRate = 48000;
   let channels = 1;
   let bitsPerSample = 16;
   let dataOffset = -1;
@@ -124,25 +192,56 @@ export function decodePcmWavBuffer(buffer: ArrayBuffer): DecodedAudioMono | null
     offset += 8 + size + (size % 2);
   }
 
-  if (dataOffset < 0 || bitsPerSample !== 16 || sampleRate <= 0) return null;
+  if (dataOffset < 0 || bitsPerSample !== 16 || sampleRate <= 0 || channels <= 0) return null;
 
-  const totalFrames = Math.floor(dataSize / (2 * Math.max(1, channels)));
-  const samples = new Float32Array(totalFrames);
+  const totalFrames = Math.floor(dataSize / (2 * channels));
+  const left = new Float32Array(totalFrames);
+  const right = new Float32Array(totalFrames);
   let readPos = dataOffset;
 
   for (let i = 0; i < totalFrames; i += 1) {
-    let sum = 0;
-    for (let ch = 0; ch < channels; ch += 1) {
-      sum += view.getInt16(readPos, true) / 32768;
+    if (channels === 1) {
+      const s = view.getInt16(readPos, true) / 32768;
+      left[i] = s;
+      right[i] = s;
       readPos += 2;
+    } else {
+      left[i] = view.getInt16(readPos, true) / 32768;
+      right[i] = view.getInt16(readPos + 2, true) / 32768;
+      readPos += 2 * channels;
     }
-    samples[i] = sum / channels;
   }
 
   return {
-    samples,
+    left,
+    right,
+    channels,
     sampleRate,
-    durationMs: measureSamplesDurationMs(samples.length, sampleRate),
+    durationMs: measureSamplesDurationMs(totalFrames, sampleRate),
+  };
+}
+
+/**
+ * Decodes a 16-bit PCM RIFF/WAV ArrayBuffer into mono Float32Array deterministically.
+ */
+export function decodePcmWavBuffer(buffer: ArrayBuffer): DecodedAudioMono | null {
+  const stereo = decodePcmWavBufferStereo(buffer);
+  if (!stereo) return null;
+  if (stereo.channels === 1) {
+    return {
+      samples: stereo.left,
+      sampleRate: stereo.sampleRate,
+      durationMs: stereo.durationMs,
+    };
+  }
+  const mono = new Float32Array(stereo.left.length);
+  for (let i = 0; i < mono.length; i += 1) {
+    mono[i] = 0.5 * (stereo.left[i] + stereo.right[i]);
+  }
+  return {
+    samples: mono,
+    sampleRate: stereo.sampleRate,
+    durationMs: stereo.durationMs,
   };
 }
 
@@ -152,7 +251,7 @@ export function measureSamplesDurationMs(sampleCount: number, sampleRate: number
 }
 
 /**
- * Resamples mono Float32Array to target sample rate (e.g. 16000 Hz for Whisper / PyAnnote).
+ * Resamples mono Float32Array to target sample rate using linear interpolation.
  */
 export function resampleMono(
   samples: Float32Array,
@@ -175,20 +274,52 @@ export function resampleMono(
 }
 
 /**
- * Browser media blob decoder returning 16 kHz mono Float32Array.
+ * Slices a specific time window [startMs, endMs] from a native stereo buffer and
+ * downmixes + resamples ONLY that chunk to 16 kHz mono for ML models (Whisper, PyAnnote).
+ * Avoids storing duplicate full-length mono copies in memory.
  */
-export async function decodeMediaBlobToMono16k(blob: Blob): Promise<DecodedAudioMono> {
+export function extractMono16kChunkFromStereo(
+  stereo: DecodedAudioStereo,
+  startMs: number,
+  endMs: number
+): DecodedAudioMono {
+  const sIdx = Math.max(0, Math.floor((startMs / 1000) * stereo.sampleRate));
+  const eIdx = Math.min(stereo.left.length, Math.ceil((endMs / 1000) * stereo.sampleRate));
+  const len = Math.max(0, eIdx - sIdx);
+  if (len === 0) {
+    return { samples: new Float32Array(0), sampleRate: 16000, durationMs: 0 };
+  }
+  const monoSlice = new Float32Array(len);
+  if (stereo.channels === 1) {
+    monoSlice.set(stereo.left.subarray(sIdx, eIdx));
+  } else {
+    for (let i = 0; i < len; i += 1) {
+      monoSlice[i] = 0.5 * (stereo.left[sIdx + i] + stereo.right[sIdx + i]);
+    }
+  }
+  const resampled = resampleMono(monoSlice, stereo.sampleRate, 16000);
+  return {
+    samples: resampled,
+    sampleRate: 16000,
+    durationMs: measureSamplesDurationMs(resampled.length, 16000),
+  };
+}
+
+/**
+ * Browser media blob decoder preserving native stereo channels & high sample rate (44.1 / 48 kHz)
+ * for video containers (MP4, WebM, MOV) and audio files (WAV, MP3, M4A, FLAC, OGG).
+ * Honestly reports unsupported containers (e.g. MKV when browser cannot decode its codec).
+ */
+export async function decodeMediaBlobToStereo(
+  blob: Blob,
+  fileExtension?: string
+): Promise<DecodedAudioStereo> {
   const arrayBuffer = await blob.arrayBuffer();
 
-  // Fast deterministic path for 16-bit PCM WAV files
-  const wavDecoded = decodePcmWavBuffer(arrayBuffer);
+  // Fast deterministic path for 16-bit PCM WAV files (zero AudioContext resampling)
+  const wavDecoded = decodePcmWavBufferStereo(arrayBuffer);
   if (wavDecoded) {
-    const resampled = resampleMono(wavDecoded.samples, wavDecoded.sampleRate, 16000);
-    return {
-      samples: resampled,
-      sampleRate: 16000,
-      durationMs: measureSamplesDurationMs(resampled.length, 16000),
-    };
+    return wavDecoded;
   }
 
   const AudioCtx =
@@ -198,60 +329,186 @@ export async function decodeMediaBlobToMono16k(blob: Blob): Promise<DecodedAudio
       : undefined;
 
   if (!AudioCtx) {
-    throw new Error('Web Audio API is unavailable in this environment to decode audio streams.');
+    throw new Error('Web Audio API is unavailable in this environment to decode media streams.');
   }
 
   const ctx = new AudioCtx();
   try {
     const decoded = await ctx.decodeAudioData(arrayBuffer.slice(0));
-    const numChannels = decoded.numberOfChannels;
-    const length = decoded.length;
-    const mono = new Float32Array(length);
+    const channels = decoded.numberOfChannels;
+    const left = new Float32Array(decoded.getChannelData(0));
+    const right =
+      channels >= 2
+        ? new Float32Array(decoded.getChannelData(1))
+        : new Float32Array(left);
 
-    for (let ch = 0; ch < numChannels; ch += 1) {
-      const channelData = decoded.getChannelData(ch);
-      for (let i = 0; i < length; i += 1) {
-        mono[i] += channelData[i] / numChannels;
-      }
-    }
-
-    const resampled = resampleMono(mono, decoded.sampleRate, 16000);
     return {
-      samples: resampled,
-      sampleRate: 16000,
-      durationMs: measureSamplesDurationMs(resampled.length, 16000),
+      left,
+      right,
+      channels,
+      sampleRate: decoded.sampleRate,
+      durationMs: measureSamplesDurationMs(left.length, decoded.sampleRate),
     };
+  } catch (err) {
+    const extNote = fileExtension ? `.${fileExtension.toLowerCase()}` : 'this container';
+    throw new Error(
+      `Browser audio decoder could not extract PCM audio from ${extNote} (containers such as MKV or AC-3/DTS tracks require remuxing to MP4/WebM/WAV before local web decoding). Original decoder detail: ${
+        err instanceof Error ? err.message : String(err)
+      }`
+    );
   } finally {
     await ctx.close().catch(() => undefined);
   }
 }
 
 /**
+ * Browser media blob decoder returning 16 kHz mono Float32Array (used ONLY for ML models
+ * like Whisper and PyAnnote that require 16 kHz mono input).
+ */
+export async function decodeMediaBlobToMono16k(
+  blob: Blob,
+  fileExtension?: string
+): Promise<DecodedAudioMono> {
+  const stereo = await decodeMediaBlobToStereo(blob, fileExtension);
+  return extractMono16kChunkFromStereo(stereo, 0, stereo.durationMs);
+}
+
+/**
+ * Pitch-preserving Waveform Similarity Overlap-Add (WSOLA) time-stretcher in pure TypeScript.
+ * Physically modifies the PCM audio length by speedMultiplier (bounded strictly to [0.88, 1.15])
+ * WITHOUT altering vocal pitch, so Agent #20 Synchronization produces real synchronized WAV files.
+ * - speedMultiplier > 1.0 -> shorter duration (faster speech, same pitch)
+ * - speedMultiplier < 1.0 -> longer duration (slower speech, same pitch)
+ */
+export function timeStretchPcmWSOLA(
+  samples: Float32Array,
+  sampleRate: number,
+  speedMultiplier: number
+): { samples: Float32Array; sampleRate: number; durationMs: number; appliedSpeed: number } {
+  const clampedSpeed = Math.round(Math.min(1.15, Math.max(0.88, speedMultiplier)) * 1000) / 1000;
+  if (samples.length < 512 || Math.abs(clampedSpeed - 1.0) < 0.005) {
+    return {
+      samples: new Float32Array(samples),
+      sampleRate,
+      durationMs: measureSamplesDurationMs(samples.length, sampleRate),
+      appliedSpeed: 1.0,
+    };
+  }
+
+  // 32ms Hann analysis window, 50% synthesis hop, ±8ms similarity search tolerance
+  const winLen = Math.max(256, Math.round(sampleRate * 0.032));
+  const synHop = Math.max(64, Math.floor(winLen / 2));
+  const anaHopFloat = synHop * clampedSpeed;
+  const searchRadius = Math.max(16, Math.round(sampleRate * 0.008));
+
+  const targetOutLen = Math.max(winLen, Math.round(samples.length / clampedSpeed));
+  const out = new Float32Array(targetOutLen + winLen);
+  const norm = new Float32Array(targetOutLen + winLen);
+
+  // Precompute Hann window
+  const hann = new Float32Array(winLen);
+  for (let i = 0; i < winLen; i += 1) {
+    hann[i] = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (winLen - 1)));
+  }
+
+  // Copy first frame directly
+  let outPos = 0;
+  let lastAnaPos = 0;
+  for (let i = 0; i < winLen && i < samples.length; i += 1) {
+    out[i] += samples[i] * hann[i];
+    norm[i] += hann[i];
+  }
+
+  let frameIndex = 1;
+  while (outPos + synHop + winLen <= out.length) {
+    outPos += synHop;
+    const idealAnaPos = Math.round(frameIndex * anaHopFloat);
+    if (idealAnaPos + winLen >= samples.length) break;
+
+    // Natural continuation reference from previous frame
+    const refPos = Math.min(samples.length - winLen, lastAnaPos + synHop);
+    const searchStart = Math.max(0, idealAnaPos - searchRadius);
+    const searchEnd = Math.min(samples.length - winLen, idealAnaPos + searchRadius);
+
+    let bestPos = idealAnaPos;
+    let bestCorr = -Infinity;
+
+    // Cross-correlation over overlap region (step by 2 for speed while retaining phase lock)
+    const corrLen = Math.min(synHop, winLen);
+    for (let cand = searchStart; cand <= searchEnd; cand += 2) {
+      let dot = 0;
+      let energy = 1e-8;
+      for (let k = 0; k < corrLen; k += 2) {
+        const r = samples[refPos + k];
+        const c = samples[cand + k];
+        dot += r * c;
+        energy += c * c;
+      }
+      const score = dot / Math.sqrt(energy);
+      if (score > bestCorr) {
+        bestCorr = score;
+        bestPos = cand;
+      }
+    }
+
+    for (let i = 0; i < winLen; i += 1) {
+      out[outPos + i] += samples[bestPos + i] * hann[i];
+      norm[outPos + i] += hann[i];
+    }
+
+    lastAnaPos = bestPos;
+    frameIndex += 1;
+  }
+
+  const trimmed = new Float32Array(targetOutLen);
+  for (let i = 0; i < targetOutLen; i += 1) {
+    const val = norm[i] > 1e-4 ? out[i] / norm[i] : out[i];
+    trimmed[i] = Math.max(-0.98, Math.min(0.98, val));
+  }
+
+  return {
+    samples: trimmed,
+    sampleRate,
+    durationMs: measureSamplesDurationMs(trimmed.length, sampleRate),
+    appliedSpeed: clampedSpeed,
+  };
+}
+
+/**
  * Energy + Zero-Crossing Voice Activity Detection returning non-silent speech windows.
+ * Also flags high-density multi-band spectral flux windows as potential overlapping speech.
  * Never fabricates speech intervals if the signal is silent.
  */
 export function detectVoiceActivitySegments(
   samples: Float32Array,
-  sampleRate: number
+  sampleRate: number,
+  globalOffsetMs: number = 0
 ): SpeechInterval[] {
   if (samples.length === 0 || sampleRate <= 0) return [];
 
   const frameMs = 50;
   const frameLen = Math.max(1, Math.round((sampleRate * frameMs) / 1000));
   const frameEnergies: number[] = [];
+  const frameZcr: number[] = [];
 
   for (let start = 0; start < samples.length; start += frameLen) {
     const end = Math.min(samples.length, start + frameLen);
     let sumSq = 0;
+    let crossings = 0;
     for (let i = start; i < end; i += 1) {
-      sumSq += samples[i] * samples[i];
+      const v = samples[i];
+      sumSq += v * v;
+      if (i > start) {
+        const prev = samples[i - 1];
+        if ((prev >= 0 && v < 0) || (prev < 0 && v >= 0)) crossings += 1;
+      }
     }
     const rms = Math.sqrt(sumSq / Math.max(1, end - start));
     const db = rms > 1e-7 ? 20 * Math.log10(rms) : -90;
     frameEnergies.push(db);
+    frameZcr.push(crossings / Math.max(1, end - start));
   }
 
-  // Adaptive noise floor (20th percentile) + speech threshold
   const sortedDb = [...frameEnergies].sort((a, b) => a - b);
   const noiseFloorDb = sortedDb[Math.floor(sortedDb.length * 0.2)] ?? -65;
   const speechThresholdDb = Math.max(-48, noiseFloorDb + 9);
@@ -261,6 +518,27 @@ export function detectVoiceActivitySegments(
   let segStartFrame = 0;
   let silenceFrames = 0;
   const maxBridgeSilenceFrames = 6; // 300ms pause tolerance
+  const localDurationMs = measureSamplesDurationMs(samples.length, sampleRate);
+
+  const pushInterval = (startFrame: number, endFrame: number) => {
+    const durationFrames = endFrame - startFrame;
+    if (durationFrames < 4) return;
+    const energySlice = frameEnergies.slice(startFrame, endFrame);
+    const zcrSlice = frameZcr.slice(startFrame, endFrame);
+    const avgDb = energySlice.reduce((a, b) => a + b, 0) / durationFrames;
+    const zcrMean = zcrSlice.reduce((a, b) => a + b, 0) / durationFrames;
+    const zcrVar =
+      zcrSlice.reduce((acc, z) => acc + Math.pow(z - zcrMean, 2), 0) / durationFrames;
+    // Heuristic overlap cue: high sustained energy + high ZCR variance indicates simultaneous voices
+    const overlapping = avgDb > -18 && Math.sqrt(zcrVar) > 0.085 && durationFrames >= 10;
+
+    intervals.push({
+      startMs: globalOffsetMs + startFrame * frameMs,
+      endMs: globalOffsetMs + Math.min(localDurationMs, endFrame * frameMs),
+      energyDb: Math.round(avgDb * 10) / 10,
+      overlapping,
+    });
+  };
 
   for (let f = 0; f < frameEnergies.length; f += 1) {
     const active = frameEnergies[f] >= speechThresholdDb;
@@ -273,20 +551,7 @@ export function detectVoiceActivitySegments(
     } else if (inSpeech) {
       silenceFrames += 1;
       if (silenceFrames > maxBridgeSilenceFrames) {
-        const endFrame = f - silenceFrames + 1;
-        const durationFrames = endFrame - segStartFrame;
-        if (durationFrames >= 4) {
-          const avgDb =
-            frameEnergies
-              .slice(segStartFrame, endFrame)
-              .reduce((a, b) => a + b, 0) / durationFrames;
-          intervals.push({
-            startMs: segStartFrame * frameMs,
-            endMs: Math.min(measureSamplesDurationMs(samples.length, sampleRate), endFrame * frameMs),
-            energyDb: Math.round(avgDb * 10) / 10,
-            overlapping: false,
-          });
-        }
+        pushInterval(segStartFrame, f - silenceFrames + 1);
         inSpeech = false;
         silenceFrames = 0;
       }
@@ -294,23 +559,60 @@ export function detectVoiceActivitySegments(
   }
 
   if (inSpeech) {
-    const endFrame = frameEnergies.length;
-    const durationFrames = endFrame - segStartFrame;
-    if (durationFrames >= 4) {
-      const avgDb =
-        frameEnergies
-          .slice(segStartFrame, endFrame)
-          .reduce((a, b) => a + b, 0) / durationFrames;
-      intervals.push({
-        startMs: segStartFrame * frameMs,
-        endMs: measureSamplesDurationMs(samples.length, sampleRate),
-        energyDb: Math.round(avgDb * 10) / 10,
-        overlapping: false,
-      });
-    }
+    pushInterval(segStartFrame, frameEnergies.length);
   }
 
   return intervals;
+}
+
+/**
+ * Chunk-based Voice Activity Detection over long stereo episodes using ChunkDefinition plan
+ * (30s chunks, 2s overlap) with overlap-aware deduplication and global timestamps.
+ */
+export function detectVoiceActivityChunked(
+  stereo: DecodedAudioStereo,
+  chunkPlan: ChunkDefinition[]
+): SpeechInterval[] {
+  const effectiveChunks =
+    chunkPlan.length > 0
+      ? chunkPlan
+      : [
+          {
+            index: 0,
+            startMs: 0,
+            endMs: stereo.durationMs,
+            overlapStartMs: 0,
+            overlapEndMs: stereo.durationMs,
+            status: 'planned' as const,
+          },
+        ];
+
+  const allIntervals: SpeechInterval[] = [];
+  for (const ch of effectiveChunks) {
+    const monoChunk = extractMono16kChunkFromStereo(stereo, ch.overlapStartMs, ch.overlapEndMs);
+    const localIntervals = detectVoiceActivitySegments(
+      monoChunk.samples,
+      monoChunk.sampleRate,
+      ch.overlapStartMs
+    );
+
+    for (const iv of localIntervals) {
+      // Keep segments whose midpoint belongs to this chunk's authoritative [startMs, endMs]
+      const mid = (iv.startMs + iv.endMs) / 2;
+      if (mid < ch.startMs || mid > ch.endMs) continue;
+
+      const prev = allIntervals[allIntervals.length - 1];
+      if (prev && iv.startMs <= prev.endMs + 120) {
+        prev.endMs = Math.max(prev.endMs, iv.endMs);
+        prev.energyDb = Math.round(((prev.energyDb + iv.energyDb) / 2) * 10) / 10;
+        prev.overlapping = prev.overlapping || iv.overlapping;
+      } else {
+        allIntervals.push(iv);
+      }
+    }
+  }
+
+  return allIntervals;
 }
 
 /**
@@ -322,8 +624,8 @@ function estimateWindowPitchHz(
   length: number,
   sampleRate: number
 ): number | null {
-  const minLag = Math.floor(sampleRate / 420); // 420 Hz max human F0
-  const maxLag = Math.min(Math.floor(length / 2), Math.floor(sampleRate / 65)); // 65 Hz min F0
+  const minLag = Math.floor(sampleRate / 420);
+  const maxLag = Math.min(Math.floor(length / 2), Math.floor(sampleRate / 65));
   if (maxLag <= minLag) return null;
 
   let energy = 0;
@@ -364,7 +666,6 @@ function estimateWindowPitchHz(
 
 /**
  * Extracts a compact deterministic 10-dimensional acoustic speaker embedding vector
- * (F0 pitch statistics, ZCR, spectral band ratios across 6 frequency bands, RMS profile)
  * for cosine-similarity recurring speaker clustering.
  */
 export function extractAcousticSpeakerEmbedding(
@@ -373,7 +674,6 @@ export function extractAcousticSpeakerEmbedding(
 ): number[] {
   if (samples.length < 256) return new Array(10).fill(0);
 
-  // 1. Pitch statistics across 40ms frames
   const winLen = Math.min(samples.length, Math.round(sampleRate * 0.04));
   const step = Math.max(128, Math.round(winLen / 2));
   const pitches: number[] = [];
@@ -396,22 +696,18 @@ export function extractAcousticSpeakerEmbedding(
     zcrSum += crossings / winLen;
     rmsSum += Math.sqrt(sq / winLen);
     frameCount += 1;
-    if (frameCount >= 40) break; // bounded cost for long segments
+    if (frameCount >= 40) break;
   }
 
   const meanPitch =
-    pitches.length > 0
-      ? pitches.reduce((a, b) => a + b, 0) / pitches.length
-      : 160;
+    pitches.length > 0 ? pitches.reduce((a, b) => a + b, 0) / pitches.length : 160;
   const pitchStd =
     pitches.length > 1
       ? Math.sqrt(
-          pitches.reduce((acc, p) => acc + Math.pow(p - meanPitch, 2), 0) /
-            pitches.length
+          pitches.reduce((acc, p) => acc + Math.pow(p - meanPitch, 2), 0) / pitches.length
         )
       : 15;
 
-  // 2. 6-band Goertzel spectral energy profile (200, 500, 1000, 2000, 3500, 5500 Hz)
   const targetFreqs = [200, 500, 1000, 2000, 3500, 5500];
   const dftLen = Math.min(samples.length, 2048);
   const bandEnergies = targetFreqs.map((freq) => {
@@ -437,7 +733,6 @@ export function extractAcousticSpeakerEmbedding(
     ...bandEnergies,
   ];
 
-  // L2 normalize for cosine similarity
   const norm = Math.sqrt(rawVec.reduce((acc, v) => acc + v * v, 0)) || 1;
   return rawVec.map((v) => v / norm);
 }
@@ -459,8 +754,7 @@ export function cosineSimilarity(a: number[], b: number[]): number {
 
 /**
  * Speaker Diarization clustering: groups recurring turns by acoustic embedding similarity
- * so the same speaker keeps a persistent SPK_01 / SPK_02 ID across scenes instead of spawning
- * a new Speaker ID per sentence.
+ * with calibrated confidence (never overclaiming certainty on fallback spectral clustering).
  */
 export function clusterSpeakerIntervals(
   samples: Float32Array,
@@ -473,10 +767,7 @@ export function clusterSpeakerIntervals(
 
   for (const interval of intervals) {
     const startIdx = Math.max(0, Math.floor((interval.startMs / 1000) * sampleRate));
-    const endIdx = Math.min(
-      samples.length,
-      Math.ceil((interval.endMs / 1000) * sampleRate)
-    );
+    const endIdx = Math.min(samples.length, Math.ceil((interval.endMs / 1000) * sampleRate));
     const slice = samples.subarray(startIdx, endIdx);
     const embedding = extractAcousticSpeakerEmbedding(slice, sampleRate);
 
@@ -496,8 +787,8 @@ export function clusterSpeakerIntervals(
     if (bestIdx >= 0 && bestSim >= similarityThreshold) {
       const cluster = centroids[bestIdx];
       label = cluster.label;
-      confidence = Math.min(0.95, Math.max(0.55, bestSim));
-      // Running centroid update
+      // Calibrated confidence bounded strictly below 0.86 for acoustic spectral clustering
+      confidence = Math.min(0.86, Math.max(0.5, bestSim * 0.9));
       const nextCount = cluster.count + 1;
       cluster.vec = cluster.vec.map(
         (val, dim) => (val * cluster.count + embedding[dim]) / nextCount
@@ -506,7 +797,7 @@ export function clusterSpeakerIntervals(
     } else {
       const nextNum = centroids.length + 1;
       label = `SPK_${String(nextNum).padStart(2, '0')}`;
-      confidence = centroids.length === 0 ? 0.8 : 0.72;
+      confidence = centroids.length === 0 ? 0.68 : 0.62;
       centroids.push({ label, vec: embedding, count: 1 });
     }
 
@@ -525,7 +816,6 @@ export function clusterSpeakerIntervals(
 
 /**
  * Voice Analysis Agent (#8): computes real acoustic measurements on a speaker's PCM turns.
- * Explicitly estimates audible vocal presentation without making identity assumptions.
  */
 export function analyzeVoiceAcoustics(
   samples: Float32Array,
@@ -578,8 +868,10 @@ export function analyzeVoiceAcoustics(
   const spectralCentroidHz = Math.round(zcr * (sampleRate / 2));
 
   pitches.sort((a, b) => a - b);
-  const pitchMinHz = pitches.length > 0 ? Math.round(pitches[Math.floor(pitches.length * 0.1)]) : null;
-  const pitchMaxHz = pitches.length > 0 ? Math.round(pitches[Math.floor(pitches.length * 0.9)]) : null;
+  const pitchMinHz =
+    pitches.length > 0 ? Math.round(pitches[Math.floor(pitches.length * 0.1)]) : null;
+  const pitchMaxHz =
+    pitches.length > 0 ? Math.round(pitches[Math.floor(pitches.length * 0.9)]) : null;
   const pitchMeanHz =
     pitches.length > 0
       ? Math.round(pitches.reduce((a, b) => a + b, 0) / pitches.length)
@@ -592,7 +884,6 @@ export function analyzeVoiceAcoustics(
     spokenCharCount > 0 ? Math.round((spokenCharCount / durationSec) * 10) / 10 : null;
   const speechDutyCycle = activeFrames / Math.max(1, totalFrames);
 
-  // Cautious audible vocal-presentation estimates (never identity assertions)
   let genderPresentation = 'Uncertain / Neutral vocal presentation';
   let ageEstimate = 'Adult-sounding (estimate)';
 
@@ -675,7 +966,7 @@ export function analyzeVoiceAcoustics(
 
 /**
  * Post-synthesis Web Audio DSP adjustment for Voice Acting (#19) & Synchronization (#20).
- * Keeps speed bounded strictly within [0.85, 1.18] so speech remains natural.
+ * Uses pitch-preserving WSOLA for rateMultiplier and separates modest pitch shift + gain + pause padding.
  */
 export function applyPostSynthesisDsp(
   samples: Float32Array,
@@ -687,26 +978,38 @@ export function applyPostSynthesisDsp(
     pausePaddingMs?: number;
   }
 ): { samples: Float32Array; sampleRate: number; durationMs: number } {
-  const rate = Math.min(1.18, Math.max(0.85, options.rateMultiplier ?? 1.0));
-  const pitchFactor = Math.pow(2, Math.min(3.5, Math.max(-3.5, options.pitchSemitones ?? 0)) / 12);
-  // Modest combined playback factor bounded so output stays intelligible
-  const combinedFactor = Math.min(1.22, Math.max(0.82, rate * (1 + (pitchFactor - 1) * 0.45)));
+  const rate = Math.min(1.15, Math.max(0.88, options.rateMultiplier ?? 1.0));
+  const pitchSt = Math.min(3.0, Math.max(-3.0, options.pitchSemitones ?? 0));
+  let working = samples;
 
-  const outCoreLen = Math.max(1, Math.round(samples.length / combinedFactor));
+  // 1. Apply modest pitch shift (resampling + compensating WSOLA keeps duration stable)
+  if (Math.abs(pitchSt) >= 0.15 && working.length >= 512) {
+    const pitchRatio = Math.pow(2, pitchSt / 12);
+    const pitchedLen = Math.max(1, Math.round(working.length / pitchRatio));
+    const pitched = new Float32Array(pitchedLen);
+    for (let i = 0; i < pitchedLen; i += 1) {
+      const src = i * pitchRatio;
+      const lo = Math.floor(src);
+      const hi = Math.min(working.length - 1, lo + 1);
+      const frac = src - lo;
+      pitched[i] = working[lo] * (1 - frac) + working[hi] * frac;
+    }
+    // Compensate duration change using WSOLA combined with requested rateMultiplier
+    const compensatedRate = Math.min(1.15, Math.max(0.88, rate / pitchRatio));
+    working = timeStretchPcmWSOLA(pitched, sampleRate, compensatedRate).samples;
+  } else if (Math.abs(rate - 1.0) >= 0.005) {
+    working = timeStretchPcmWSOLA(working, sampleRate, rate).samples;
+  }
+
   const padSamples = Math.max(
     0,
     Math.round(((options.pausePaddingMs ?? 0) / 1000) * sampleRate)
   );
   const gainLinear = Math.pow(10, Math.min(6, Math.max(-12, options.gainDb ?? 0)) / 20);
 
-  const output = new Float32Array(outCoreLen + padSamples);
-  for (let i = 0; i < outCoreLen; i += 1) {
-    const srcPos = i * combinedFactor;
-    const low = Math.floor(srcPos);
-    const high = Math.min(samples.length - 1, low + 1);
-    const frac = srcPos - low;
-    const val = (samples[low] * (1 - frac) + samples[high] * frac) * gainLinear;
-    output[i] = Math.max(-0.98, Math.min(0.98, val));
+  const output = new Float32Array(working.length + padSamples);
+  for (let i = 0; i < working.length; i += 1) {
+    output[i] = Math.max(-0.98, Math.min(0.98, working[i] * gainLinear));
   }
 
   return {

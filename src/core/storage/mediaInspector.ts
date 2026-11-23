@@ -256,13 +256,14 @@ export async function probeMediaFile(
       }
     }
 
-    // 2. Fallback Web Audio header probe for compressed audio files <= 25 MB when native sample rate not yet read
+    // 2. Fallback Web Audio header probe for decodable audio or video containers <= 25 MB (skipping MKV which browsers rarely decode via Web Audio)
     const AudioCtx =
       typeof window !== 'undefined'
         ? window.AudioContext || (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
         : undefined;
 
-    if (sampleRateHz === null && AudioCtx && file.size <= 25 * 1024 * 1024 && kind === 'audio') {
+    const isMkv = /matroska|mkv/i.test(containerLabel);
+    if (sampleRateHz === null && AudioCtx && file.size <= 25 * 1024 * 1024 && !isMkv) {
       const ctx = new AudioCtx();
       try {
         const buffer = await file.arrayBuffer();
@@ -273,17 +274,21 @@ export async function probeMediaFile(
           durationMs = Math.round(decoded.duration * 1000);
         }
       } catch {
-        notes.push('Web Audio API could not decode audio stream header in this browser.');
+        notes.push(
+          kind === 'video'
+            ? `Web Audio could not directly demux ${containerLabel} audio header; container audio will be checked during pipeline extraction.`
+            : 'Web Audio API could not decode audio stream header in this browser.'
+        );
       } finally {
         await ctx.close().catch(() => undefined);
       }
-    } else if (kind === 'video') {
+    } else if (isMkv) {
       notes.push(
-        'Audio sample rate, channel layout, and exact frame rate require container demuxing (reserved for native/FFmpeg-WASM or Prompt 2 media pipeline).'
+        'Matroska (MKV) containers are preserved safely in original_media, but most web browsers cannot natively decode MKV audio tracks via Web Audio; remux to MP4/WebM/WAV if local audio extraction fails.'
       );
     } else if (sampleRateHz === null && file.size > 25 * 1024 * 1024) {
       notes.push(
-        'Skipped full in-memory Web Audio decode (>25 MB memory guard) to comply with 8 GB device budget.'
+        'Skipped full in-memory Web Audio probe (>25 MB memory guard) to comply with 8 GB device budget; chunked decode will inspect stream during processing.'
       );
     }
   } finally {

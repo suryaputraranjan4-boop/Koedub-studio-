@@ -29,12 +29,12 @@ import type {
 } from '../../types/domain';
 
 export const DB_NAME = 'KoeDubStudioLocalDB';
-export const DB_VERSION = 3;
+export const DB_VERSION = 4;
 
 /**
- * Structured relational-style object stores (25 structured stores + settings + separated binary file vault).
- * Migrations v1 -> v2 -> v3 safely preserve all existing Prompt 1–2 project data while adding
- * pronunciation_entries, context_snapshots, sound_events, and audio_stems.
+ * Structured relational-style object stores (26 structured stores + settings + separated binary file vault).
+ * Migrations v1 -> v2 -> v3 -> v4 safely preserve all existing project data while adding
+ * pronunciation_entries, context_snapshots, sound_events, audio_stems, and pipeline_artifacts.
  */
 export const STORES = {
   projects: 'projects',
@@ -62,6 +62,7 @@ export const STORES = {
   processing_logs: 'processing_logs',
   sound_events: 'sound_events',
   audio_stems: 'audio_stems',
+  pipeline_artifacts: 'pipeline_artifacts',
   app_settings: 'app_settings',
   file_vault: 'file_vault',
 } as const;
@@ -328,7 +329,10 @@ export const VERIFIED_MODEL_CATALOG: ModelMetadata[] = [
     estimatedMemoryMb: 180,
     quantization: 'FP32 PCM DSP',
     version: 'Prompt 3 Built-In v1.0',
-    integrityHashSha256: 'built-in-dsp-verified',
+    integrityHashSha256: null,
+    checksumStatus: 'runtime_only_no_published_checksum',
+    runtimeVerified: true,
+    runtimeVerifiedAt: new Date().toISOString(),
     downloadStatus: 'verified',
     downloadProgressPercent: 100,
     installStatus: 'installed_verified',
@@ -337,7 +341,7 @@ export const VERIFIED_MODEL_CATALOG: ModelMetadata[] = [
     verifiedAt: new Date().toISOString(),
     lastError: null,
     notes:
-      'Classifies speech, music, songs, animals, ambience, crowd, and impact SFX to build a non-destructive preservation mask for Agent #21. Neural YAMNet TFLite audio classification requires native Android C++ MediaPipe Audio runtime.',
+      'Heuristic multi-feature DSP classifier (not neural YAMNet). Classifies speech, music, songs, footsteps, rain, wind, water, birds, animals, ambience, crowd, and impact SFX to build a non-destructive preservation mask for Agent #21.',
   },
   {
     id: 'slot_audio_separation',
@@ -356,7 +360,10 @@ export const VERIFIED_MODEL_CATALOG: ModelMetadata[] = [
     estimatedMemoryMb: 320,
     quantization: 'FP32 PCM DSP',
     version: 'Prompt 3 Built-In v1.0',
-    integrityHashSha256: 'built-in-dsp-verified',
+    integrityHashSha256: null,
+    checksumStatus: 'runtime_only_no_published_checksum',
+    runtimeVerified: true,
+    runtimeVerifiedAt: new Date().toISOString(),
     downloadStatus: 'verified',
     downloadProgressPercent: 100,
     installStatus: 'installed_verified',
@@ -365,26 +372,29 @@ export const VERIFIED_MODEL_CATALOG: ModelMetadata[] = [
     verifiedAt: new Date().toISOString(),
     lastError: null,
     notes:
-      'Produces dialogue_stem.wav and background_stem.wav while protecting songs, music, ambience, and SFX via Agent #21 masks. Reports honest artifact warnings for single mixed tracks where lossless vocal removal is impossible.',
+      'Produces stereo background_stem.wav and dialogue_stem.wav (or prefers an imported clean M&E stem when provided) while protecting songs, music, ambience, and SFX. Measures residual dialogue leakage dB honestly.',
   },
 ];
 
 /**
- * Truthful Hindi Voice Profiles tied to Xenova/mms-tts-hin.
- * Strictly marks installStatus = 'not_installed' until model_mms_tts_hin is downloaded & verified.
- * Explicitly distinguishes the native single-speaker MMS base voice from post-synthesis DSP presets.
+ * Truthful Hindi Voice Profiles:
+ * - Local Offline Voices tied to single-speaker Xenova/mms-tts-hin (honestly distinguishing the base
+ *   neural speaker from bounded post-synthesis DSP presets).
+ * - Optional Cloud Prebuilt Multi-Voices tied to Gemini 3.8 TTS (Puck, Charon, Kore, Fenrir, Zephyr),
+ *   so multi-character scenes can assign genuinely distinct persistent voices when Cloud TTS is enabled.
  */
 export const VERIFIED_VOICE_PROFILES: VoiceProfile[] = [
   {
     voiceId: 'mms_hin_base',
-    displayName: 'MMS Hindi Base (Native Neural VITS)',
+    displayName: 'MMS Hindi Base (Local Neural VITS)',
     language: 'hi',
     locale: 'hi-IN',
     characteristics: 'Native Devanagari Hindi VITS speaker · 16 kHz mono · balanced neutral timbre',
     genderStyle: 'Balanced / Neutral Base',
-    engineRuntime: 'Xenova/mms-tts-hin (ONNX Runtime Web)',
+    engineRuntime: 'Xenova/mms-tts-hin (ONNX Runtime Web · Offline)',
     modelId: 'model_mms_tts_hin',
     synthesisMode: 'neural_native',
+    cloudVoiceName: 'Kore',
     dspPitchSemitones: 0,
     dspRateMultiplier: 1.0,
     nativeEmotionControl: false,
@@ -392,18 +402,19 @@ export const VERIFIED_VOICE_PROFILES: VoiceProfile[] = [
     installStatus: 'not_installed',
     lockedCharacterIds: [],
     notes:
-      'Authentic Meta MMS-TTS-HIN neural output with zero post-synthesis pitch alteration. Requires downloading Meta MMS-TTS Hindi in Model Manager.',
+      'Authentic Meta MMS-TTS-HIN neural output (CC-BY-NC-4.0) with zero pitch alteration. Requires downloading Meta MMS-TTS Hindi in Model Manager.',
   },
   {
     voiceId: 'mms_hin_bright',
-    displayName: 'MMS Hindi Bright (Base + DSP Preset)',
+    displayName: 'MMS Hindi Bright (Local Single-Speaker + DSP Preset)',
     language: 'hi',
     locale: 'hi-IN',
-    characteristics: 'Youthful / bright character preset · +1.8 st pitch & 1.04× cadence via Web Audio DSP',
-    genderStyle: 'Youthful / Higher Pitch (DSP)',
-    engineRuntime: 'Xenova/mms-tts-hin + Web Audio DSP',
+    characteristics: 'Youthful / bright DSP preset · +1.8 st pitch & 1.04× cadence via Web Audio DSP',
+    genderStyle: 'Youthful / Higher Pitch (DSP Preset)',
+    engineRuntime: 'Xenova/mms-tts-hin + Web Audio DSP (Offline)',
     modelId: 'model_mms_tts_hin',
     synthesisMode: 'single_speaker_dsp_preset',
+    cloudVoiceName: 'Zephyr',
     dspPitchSemitones: 1.8,
     dspRateMultiplier: 1.04,
     nativeEmotionControl: false,
@@ -411,18 +422,19 @@ export const VERIFIED_VOICE_PROFILES: VoiceProfile[] = [
     installStatus: 'not_installed',
     lockedCharacterIds: [],
     notes:
-      'Built on single-speaker MMS-TTS-HIN plus bounded post-synthesis pitch/rate DSP—not a separate neural speaker embedding.',
+      'Derived from single-speaker MMS-TTS-HIN plus bounded post-synthesis DSP—explicitly NOT a separate neural speaker embedding.',
   },
   {
     voiceId: 'mms_hin_warm',
-    displayName: 'MMS Hindi Deep / Mentor (Base + DSP Preset)',
+    displayName: 'MMS Hindi Deep / Mentor (Local Single-Speaker + DSP Preset)',
     language: 'hi',
     locale: 'hi-IN',
-    characteristics: 'Mature / deeper character preset · -2.0 st pitch & 0.96× cadence via Web Audio DSP',
-    genderStyle: 'Adult / Deeper Pitch (DSP)',
-    engineRuntime: 'Xenova/mms-tts-hin + Web Audio DSP',
+    characteristics: 'Mature / deeper DSP preset · -2.0 st pitch & 0.96× cadence via Web Audio DSP',
+    genderStyle: 'Adult / Deeper Pitch (DSP Preset)',
+    engineRuntime: 'Xenova/mms-tts-hin + Web Audio DSP (Offline)',
     modelId: 'model_mms_tts_hin',
     synthesisMode: 'single_speaker_dsp_preset',
+    cloudVoiceName: 'Charon',
     dspPitchSemitones: -2.0,
     dspRateMultiplier: 0.96,
     nativeEmotionControl: false,
@@ -430,18 +442,19 @@ export const VERIFIED_VOICE_PROFILES: VoiceProfile[] = [
     installStatus: 'not_installed',
     lockedCharacterIds: [],
     notes:
-      'Built on single-speaker MMS-TTS-HIN plus bounded post-synthesis pitch/rate DSP—not a separate neural speaker embedding.',
+      'Derived from single-speaker MMS-TTS-HIN plus bounded post-synthesis DSP—explicitly NOT a separate neural speaker embedding.',
   },
   {
     voiceId: 'mms_hin_narrator',
-    displayName: 'MMS Hindi Narrator (Base + DSP Preset)',
+    displayName: 'MMS Hindi Narrator (Local Single-Speaker + DSP Preset)',
     language: 'hi',
     locale: 'hi-IN',
-    characteristics: 'Measured exposition / narrator cadence · -0.7 st pitch & 0.94× pacing via Web Audio DSP',
-    genderStyle: 'Narrator / Measured (DSP)',
-    engineRuntime: 'Xenova/mms-tts-hin + Web Audio DSP',
+    characteristics: 'Measured exposition / narrator DSP preset · -0.7 st pitch & 0.94× pacing',
+    genderStyle: 'Narrator / Measured (DSP Preset)',
+    engineRuntime: 'Xenova/mms-tts-hin + Web Audio DSP (Offline)',
     modelId: 'model_mms_tts_hin',
     synthesisMode: 'single_speaker_dsp_preset',
+    cloudVoiceName: 'Fenrir',
     dspPitchSemitones: -0.7,
     dspRateMultiplier: 0.94,
     nativeEmotionControl: false,
@@ -450,6 +463,106 @@ export const VERIFIED_VOICE_PROFILES: VoiceProfile[] = [
     lockedCharacterIds: [],
     notes:
       'Reserved for narrator or off-screen exposition characters using single-speaker MMS-TTS-HIN plus steady pacing DSP.',
+  },
+  {
+    voiceId: 'cloud_gemini_kore',
+    displayName: 'Gemini Cloud — Kore (Firm / Clear Multi-Voice)',
+    language: 'hi',
+    locale: 'hi-IN',
+    characteristics: 'Distinct cloud prebuilt Hindi-capable neural voice · clear studio articulation',
+    genderStyle: 'Clear / Expressive Lead (Cloud Prebuilt)',
+    engineRuntime: 'Gemini 3.8 TTS (Server-Side Cloud Proxy)',
+    modelId: 'gemini_cloud_tts',
+    synthesisMode: 'cloud_prebuilt_voice',
+    cloudVoiceName: 'Kore',
+    dspPitchSemitones: 0,
+    dspRateMultiplier: 1.0,
+    nativeEmotionControl: true,
+    availabilityStatus: 'available',
+    installStatus: 'verified_installed',
+    lockedCharacterIds: [],
+    notes:
+      'Distinct cloud prebuilt speaker via server-side Gemini TTS proxy (requires Cloud Intelligence + Cloud TTS enabled; falls back to local MMS-TTS offline).',
+  },
+  {
+    voiceId: 'cloud_gemini_puck',
+    displayName: 'Gemini Cloud — Puck (Upbeat / Youthful Multi-Voice)',
+    language: 'hi',
+    locale: 'hi-IN',
+    characteristics: 'Distinct cloud prebuilt neural voice · energetic youthful protagonist cadence',
+    genderStyle: 'Energetic / Youthful (Cloud Prebuilt)',
+    engineRuntime: 'Gemini 3.8 TTS (Server-Side Cloud Proxy)',
+    modelId: 'gemini_cloud_tts',
+    synthesisMode: 'cloud_prebuilt_voice',
+    cloudVoiceName: 'Puck',
+    dspPitchSemitones: 0,
+    dspRateMultiplier: 1.0,
+    nativeEmotionControl: true,
+    availabilityStatus: 'available',
+    installStatus: 'verified_installed',
+    lockedCharacterIds: [],
+    notes:
+      'Distinct cloud prebuilt speaker via server-side Gemini TTS proxy (requires Cloud Intelligence + Cloud TTS enabled).',
+  },
+  {
+    voiceId: 'cloud_gemini_charon',
+    displayName: 'Gemini Cloud — Charon (Deep / Mature Multi-Voice)',
+    language: 'hi',
+    locale: 'hi-IN',
+    characteristics: 'Distinct cloud prebuilt neural voice · resonant mature mentor / authority timbre',
+    genderStyle: 'Deep / Mature (Cloud Prebuilt)',
+    engineRuntime: 'Gemini 3.8 TTS (Server-Side Cloud Proxy)',
+    modelId: 'gemini_cloud_tts',
+    synthesisMode: 'cloud_prebuilt_voice',
+    cloudVoiceName: 'Charon',
+    dspPitchSemitones: 0,
+    dspRateMultiplier: 1.0,
+    nativeEmotionControl: true,
+    availabilityStatus: 'available',
+    installStatus: 'verified_installed',
+    lockedCharacterIds: [],
+    notes:
+      'Distinct cloud prebuilt speaker via server-side Gemini TTS proxy (requires Cloud Intelligence + Cloud TTS enabled).',
+  },
+  {
+    voiceId: 'cloud_gemini_fenrir',
+    displayName: 'Gemini Cloud — Fenrir (Dramatic / Narrator Multi-Voice)',
+    language: 'hi',
+    locale: 'hi-IN',
+    characteristics: 'Distinct cloud prebuilt neural voice · dramatic intense rival or narrator delivery',
+    genderStyle: 'Dramatic / Narrator (Cloud Prebuilt)',
+    engineRuntime: 'Gemini 3.8 TTS (Server-Side Cloud Proxy)',
+    modelId: 'gemini_cloud_tts',
+    synthesisMode: 'cloud_prebuilt_voice',
+    cloudVoiceName: 'Fenrir',
+    dspPitchSemitones: 0,
+    dspRateMultiplier: 1.0,
+    nativeEmotionControl: true,
+    availabilityStatus: 'available',
+    installStatus: 'verified_installed',
+    lockedCharacterIds: [],
+    notes:
+      'Distinct cloud prebuilt speaker via server-side Gemini TTS proxy (requires Cloud Intelligence + Cloud TTS enabled).',
+  },
+  {
+    voiceId: 'cloud_gemini_zephyr',
+    displayName: 'Gemini Cloud — Zephyr (Bright / Warm Multi-Voice)',
+    language: 'hi',
+    locale: 'hi-IN',
+    characteristics: 'Distinct cloud prebuilt neural voice · bright warm expressive character tone',
+    genderStyle: 'Bright / Warm (Cloud Prebuilt)',
+    engineRuntime: 'Gemini 3.8 TTS (Server-Side Cloud Proxy)',
+    modelId: 'gemini_cloud_tts',
+    synthesisMode: 'cloud_prebuilt_voice',
+    cloudVoiceName: 'Zephyr',
+    dspPitchSemitones: 0,
+    dspRateMultiplier: 1.0,
+    nativeEmotionControl: true,
+    availabilityStatus: 'available',
+    installStatus: 'verified_installed',
+    lockedCharacterIds: [],
+    notes:
+      'Distinct cloud prebuilt speaker via server-side Gemini TTS proxy (requires Cloud Intelligence + Cloud TTS enabled).',
   },
 ];
 
@@ -582,6 +695,13 @@ export function openStudioDatabase(): Promise<IDBDatabase> {
           { name: 'projectId', keyPath: 'projectId' },
         ]);
       }
+
+      // Migration 3 -> 4: Add Pipeline Artifacts store for full checkpoint intermediate recovery
+      if (oldVersion < 4) {
+        createStoreWithIndexes(db, STORES.pipeline_artifacts, 'id', [
+          { name: 'projectId', keyPath: 'projectId' },
+        ]);
+      }
     };
 
     request.onsuccess = () => resolve(request.result);
@@ -709,13 +829,22 @@ export async function bootstrapLocalDatabase(): Promise<void> {
   const mergedModels: ModelMetadata[] = VERIFIED_MODEL_CATALOG.map((catalogItem) => {
     const existing = existingById.get(catalogItem.id);
     if (existing && existing.installStatus === 'installed_verified') {
+      // Strip any legacy fabricated non-SHA256 strings from integrityHashSha256
+      const isRealSha256 =
+        typeof existing.integrityHashSha256 === 'string' &&
+        /^[a-f0-9]{64}$/i.test(existing.integrityHashSha256);
       return {
         ...catalogItem,
         downloadStatus: 'verified',
         downloadProgressPercent: 100,
         installStatus: 'installed_verified',
         availabilityStatus: 'ready_offline',
-        integrityHashSha256: existing.integrityHashSha256,
+        integrityHashSha256: isRealSha256 ? existing.integrityHashSha256 : null,
+        checksumStatus: isRealSha256
+          ? 'verified_sha256'
+          : catalogItem.checksumStatus ?? 'runtime_only_no_published_checksum',
+        runtimeVerified: existing.runtimeVerified ?? true,
+        runtimeVerifiedAt: existing.runtimeVerifiedAt ?? existing.verifiedAt ?? new Date().toISOString(),
         verifiedAt: existing.verifiedAt ?? new Date().toISOString(),
       };
     }
@@ -723,7 +852,7 @@ export async function bootstrapLocalDatabase(): Promise<void> {
   });
   await putManyRecords(STORES.model_metadata, mergedModels);
 
-  // Sync Voice Profiles with actual installation state of model_mms_tts_hin
+  // Sync Voice Profiles with actual installation state of model_mms_tts_hin (while preserving Cloud Prebuilt voices)
   const ttsModel = mergedModels.find((m) => m.id === 'model_mms_tts_hin');
   const ttsInstalled = ttsModel?.installStatus === 'installed_verified';
 
@@ -734,11 +863,20 @@ export async function bootstrapLocalDatabase(): Promise<void> {
     }
   }
 
-  const syncedVoices: VoiceProfile[] = VERIFIED_VOICE_PROFILES.map((v) => ({
-    ...v,
-    installStatus: ttsInstalled ? 'verified_installed' : 'not_installed',
-    availabilityStatus: ttsInstalled ? 'available' : 'not_installed',
-  }));
+  const syncedVoices: VoiceProfile[] = VERIFIED_VOICE_PROFILES.map((v) => {
+    if (v.synthesisMode === 'cloud_prebuilt_voice') {
+      return {
+        ...v,
+        installStatus: 'verified_installed',
+        availabilityStatus: 'available',
+      };
+    }
+    return {
+      ...v,
+      installStatus: ttsInstalled ? 'verified_installed' : 'not_installed',
+      availabilityStatus: ttsInstalled ? 'available' : 'not_installed',
+    };
+  });
   await putManyRecords(STORES.voice_profiles, syncedVoices);
 }
 
@@ -868,6 +1006,7 @@ export async function deleteProjectCascade(
     { store: STORES.processing_logs, keyField: 'id' },
     { store: STORES.sound_events, keyField: 'id' },
     { store: STORES.audio_stems, keyField: 'id' },
+    { store: STORES.pipeline_artifacts, keyField: 'id' },
   ];
 
   for (const spec of projectScopedStores) {

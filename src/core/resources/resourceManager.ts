@@ -35,37 +35,64 @@ export class ResourceManager {
     return total;
   }
 
+  /**
+   * Requests persistent local storage via navigator.storage.persist() when supported,
+   * reducing browser eviction risk for cached ONNX models and imported media.
+   */
+  async requestPersistentStorage(): Promise<boolean | null> {
+    if (typeof navigator === 'undefined' || !navigator.storage) return null;
+    try {
+      if (typeof navigator.storage.persisted === 'function') {
+        const already = await navigator.storage.persisted();
+        if (already) return true;
+      }
+      if (typeof navigator.storage.persist === 'function') {
+        return await navigator.storage.persist();
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
   async captureSnapshot(settings: AppSettings): Promise<ResourceSnapshot> {
     const nav = typeof navigator !== 'undefined' ? (navigator as NavigatorWithDeviceApis) : null;
 
-    // 1. Device memory (real Navigator.deviceMemory if exposed by Chromium/Android WebView)
     const deviceMemoryGb =
       nav && typeof nav.deviceMemory === 'number' && Number.isFinite(nav.deviceMemory)
         ? nav.deviceMemory
         : null;
 
-    // 2. Local storage breakdown
     const namespaces = await computeVaultNamespaceBytes();
     let quotaBytes: number | null = null;
     let usageBytes: number | null = null;
     let availableBytes: number | null = null;
+    let storagePersisted: boolean | null = null;
     let measurementSource: StorageUsageBreakdown['measurementSource'] = 'vault_accounting_only';
 
-    if (nav && nav.storage && typeof nav.storage.estimate === 'function') {
-      try {
-        const estimate = await nav.storage.estimate();
-        if (typeof estimate.quota === 'number') quotaBytes = estimate.quota;
-        if (typeof estimate.usage === 'number') usageBytes = estimate.usage;
-        if (quotaBytes !== null && usageBytes !== null) {
-          availableBytes = Math.max(0, quotaBytes - usageBytes);
+    if (nav && nav.storage) {
+      if (typeof nav.storage.estimate === 'function') {
+        try {
+          const estimate = await nav.storage.estimate();
+          if (typeof estimate.quota === 'number') quotaBytes = estimate.quota;
+          if (typeof estimate.usage === 'number') usageBytes = estimate.usage;
+          if (quotaBytes !== null && usageBytes !== null) {
+            availableBytes = Math.max(0, quotaBytes - usageBytes);
+          }
+          measurementSource = 'navigator_storage_api';
+        } catch {
+          measurementSource = 'vault_accounting_only';
         }
-        measurementSource = 'navigator_storage_api';
-      } catch {
-        measurementSource = 'vault_accounting_only';
+      }
+      if (typeof nav.storage.persisted === 'function') {
+        try {
+          storagePersisted = await nav.storage.persisted();
+        } catch {
+          storagePersisted = null;
+        }
       }
     }
 
-    // 3. Battery status when supported
     let batteryLevelPercent: number | null = null;
     let batteryCharging: boolean | null = null;
     let batterySupported = false;
@@ -81,7 +108,6 @@ export class ResourceManager {
       }
     }
 
-    // 4. Effective heavy concurrency policy
     const maxHeavyConcurrency = resolveEffectiveHeavyConcurrency({
       maxConcurrentHeavyModels: settings.maxConcurrentHeavyModels,
       maxConcurrentLightweightTasks: 3,
@@ -89,7 +115,6 @@ export class ResourceManager {
       allowTwoHeavyOnlyAboveGb: 12,
     });
 
-    // 5. Evaluate scheduler safety state
     let schedulerStatus: ResourceSnapshot['schedulerStatus'] = 'nominal';
     if (
       settings.pauseOnLowBattery &&
@@ -118,6 +143,7 @@ export class ResourceManager {
         namespaces,
         measurementSource,
       },
+      storagePersisted,
       batteryLevelPercent,
       batteryCharging,
       batterySupported,

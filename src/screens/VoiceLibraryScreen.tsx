@@ -13,6 +13,7 @@ export function VoiceLibraryScreen() {
   const {
     voices,
     characters,
+    settings,
     playingVaultKey,
     previewHindiVoice,
     stopAudioPlayback,
@@ -21,7 +22,11 @@ export function VoiceLibraryScreen() {
   const [previewBusyId, setPreviewBusyId] = useState<string | null>(null);
   const [previewNotice, setPreviewNotice] = useState<string | null>(null);
 
-  const anyInstalled = voices.some((v) => v.installStatus === 'verified_installed');
+  const anyLocalInstalled = voices.some(
+    (v) => v.synthesisMode !== 'cloud_prebuilt_voice' && v.installStatus === 'verified_installed'
+  );
+  const cloudTtsReady =
+    settings.cloudTtsEnabled && !settings.offlineOnlyMode && settings.cloudIntelligenceEnabled;
 
   const handlePreview = async (voiceId: string) => {
     setPreviewNotice(null);
@@ -57,16 +62,16 @@ export function VoiceLibraryScreen() {
       />
 
       <NoticeBanner
-        tone={anyInstalled ? 'success' : 'warning'}
+        tone={anyLocalInstalled || cloudTtsReady ? 'success' : 'warning'}
         title={
-          anyInstalled
-            ? 'Meta MMS-TTS Hindi Verified Offline'
-            : 'Meta MMS-TTS Hindi Not Installed Yet'
+          anyLocalInstalled
+            ? 'Offline Meta MMS-TTS Hindi + Optional Cloud Multi-Voices'
+            : cloudTtsReady
+            ? 'Gemini Cloud Prebuilt Multi-Voices Active (5 Distinct Speakers)'
+            : 'Local Hindi TTS Model Not Installed Yet'
         }
         description={
-          anyInstalled
-            ? 'Offline Hindi speech synthesis is active. Voice ID mms_hin_base is the native single-speaker VITS voice; the additional studio profiles apply transparent, bounded post-synthesis Web Audio DSP pitch/rate adjustments (not separate neural speaker embeddings).'
-            : 'Download & verify Meta MMS-TTS Hindi (VITS ONNX) in Model Manager to enable real Hindi voice previews and segment synthesis. Voice previews remain disabled until the model is verified locally (zero fake audio).'
+          'Cloud Prebuilt Voices (Kore, Puck, Charon, Fenrir, Zephyr) provide 5 distinct neural voices when Gemini Cloud TTS is enabled. Offline, Meta MMS-TTS-HIN (mms_hin_base) is a single-speaker VITS voice, and the 3 local studio presets transparently apply bounded WSOLA/DSP pitch and rate adjustments.'
         }
       />
 
@@ -79,7 +84,10 @@ export function VoiceLibraryScreen() {
           const assignedCharacters = characters.filter(
             (c) => c.assignedHindiVoiceId === voice.voiceId
           );
-          const isInstalled = voice.installStatus === 'verified_installed';
+          const isCloudVoice = voice.synthesisMode === 'cloud_prebuilt_voice';
+          const canPreview = isCloudVoice
+            ? cloudTtsReady
+            : voice.installStatus === 'verified_installed';
           const isPlaying = playingVaultKey === `preview:${voice.voiceId}`;
           const isBusy = previewBusyId === voice.voiceId;
 
@@ -95,8 +103,24 @@ export function VoiceLibraryScreen() {
                   </p>
                 </div>
                 <StatusText
-                  label={isInstalled ? 'Ready Offline' : 'Not Installed'}
-                  tone={isInstalled ? 'nominal' : 'warning'}
+                  label={
+                    isCloudVoice
+                      ? cloudTtsReady
+                        ? 'Cloud Multi-Voice'
+                        : 'Cloud TTS Off'
+                      : voice.installStatus === 'verified_installed'
+                      ? 'Ready Offline'
+                      : 'Not Installed'
+                  }
+                  tone={
+                    isCloudVoice
+                      ? cloudTtsReady
+                        ? 'active'
+                        : 'muted'
+                      : voice.installStatus === 'verified_installed'
+                      ? 'nominal'
+                      : 'warning'
+                  }
                 />
               </div>
 
@@ -112,17 +136,19 @@ export function VoiceLibraryScreen() {
                 <div className="flex items-center justify-between gap-2">
                   <span className="text-slate-500">Voice Source Type</span>
                   <span className="text-slate-800 font-medium text-right">
-                    {voice.synthesisMode === 'single_speaker_dsp_preset'
-                      ? `Base VITS + DSP (${voice.dspPitchSemitones} st, ${voice.dspRateMultiplier}×)`
-                      : 'Native Single-Speaker VITS'}
+                    {isCloudVoice
+                      ? `Gemini Prebuilt Neural Speaker (${voice.cloudVoiceName ?? 'Kore'})`
+                      : voice.synthesisMode === 'single_speaker_dsp_preset'
+                      ? `Local Single-Speaker DSP Preset (${voice.dspPitchSemitones} st, ${voice.dspRateMultiplier}×)`
+                      : 'Local Native Single-Speaker VITS'}
                   </span>
                 </div>
                 <div className="flex items-center justify-between gap-2">
                   <span className="text-slate-500">Native Emotion Control</span>
                   <span className="text-slate-600 text-right">
                     {voice.nativeEmotionControl
-                      ? 'Supported'
-                      : 'No (bounded post-synthesis DSP)'}
+                      ? 'Supported (Style Prompt + Post-DSP)'
+                      : 'No (bounded post-synthesis WSOLA/DSP)'}
                   </span>
                 </div>
                 <div className="flex items-center justify-between gap-2">
@@ -163,7 +189,7 @@ export function VoiceLibraryScreen() {
               ) : null}
 
               <div className="mt-4 pt-3 border-t border-slate-100 flex items-center justify-between gap-2">
-                {isInstalled ? (
+                {canPreview ? (
                   <button
                     type="button"
                     disabled={isBusy}
@@ -178,7 +204,13 @@ export function VoiceLibraryScreen() {
                     ) : (
                       <>
                         <Play className="w-3.5 h-3.5" aria-hidden="true" />
-                        <span>{isBusy ? 'Synthesizing Hindi WAV…' : 'Preview Real Hindi Voice'}</span>
+                        <span>
+                          {isBusy
+                            ? 'Synthesizing Hindi WAV…'
+                            : isCloudVoice
+                            ? 'Preview Cloud Hindi Voice'
+                            : 'Preview Local Hindi Voice'}
+                        </span>
                       </>
                     )}
                   </button>
@@ -186,11 +218,15 @@ export function VoiceLibraryScreen() {
                   <button
                     type="button"
                     disabled
-                    aria-label={`Preview ${voice.displayName} unavailable until Meta MMS-TTS Hindi is downloaded`}
+                    aria-label={`Preview ${voice.displayName} currently unavailable`}
                     className="min-h-[38px] px-3 py-1.5 rounded-lg border border-slate-200 bg-slate-50 text-slate-400 text-xs font-medium inline-flex items-center gap-1.5 cursor-not-allowed whitespace-nowrap"
                   >
                     <VolumeX className="w-3.5 h-3.5" aria-hidden="true" />
-                    <span>Install Meta MMS-TTS Hindi to Preview</span>
+                    <span>
+                      {isCloudVoice
+                        ? 'Enable Cloud TTS in Settings to Preview'
+                        : 'Install Meta MMS-TTS Hindi to Preview'}
+                    </span>
                   </button>
                 )}
               </div>
