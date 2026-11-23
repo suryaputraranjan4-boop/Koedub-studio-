@@ -39,11 +39,17 @@ interface ClientUsageTracker {
   lastSeenAtMs: number;
 }
 
-// Per-client session usage map (keyed by x-koedub-session or IP, never a single global counter)
+// Per-client usage map. Client identity is derived from Express's resolved IP,
+// never from a caller-controlled session header.
 const clientUsageMap = new Map<string, ClientUsageTracker>();
 
-// Sliding-window rate limiter per client
-const clientRateBuckets = new Map<string, { textTimestamps: number[]; ttsTimestamps: number[] }>();
+// In-process sliding-window limits. Expired entries are pruned during traffic.
+interface ClientRateBucket {
+  textTimestamps: number[];
+  ttsTimestamps: number[];
+  lastSeenAtMs: number;
+}
+const clientRateBuckets = new Map<string, ClientRateBucket>();
 const TEXT_RATE_LIMIT_PER_MIN = 30;
 const TTS_RATE_LIMIT_PER_MIN = 20;
 
@@ -60,12 +66,9 @@ let discoveredModelsCache: {
 const MODEL_DISCOVERY_TTL_MS = 10 * 60 * 1000;
 
 function getClientKey(req: Request): string {
-  const sessionHeader = req.header('x-koedub-session')?.trim();
-  if (sessionHeader && sessionHeader.length <= 80) {
-    return `sess:${sessionHeader}`;
-  }
-  const forwarded = req.header('x-forwarded-for')?.split(',')[0]?.trim();
-  return `ip:${forwarded || req.ip || 'local'}`;
+  // Express only trusts forwarded IP headers when trust proxy is explicitly configured.
+  // Do not trust x-koedub-session or parse x-forwarded-for directly: both are client-controlled.
+  return `ip:${req.ip || req.socket.remoteAddress || 'unknown'}`;
 }
 
 function getOrCreateUsage(clientKey: string): ClientUsageTracker {
@@ -102,7 +105,22 @@ function checkRateLimit(
 ): { allowed: boolean; retryAfterSec: number } {
   const now = Date.now();
   const windowMs = 60_000;
-  const entry = clientRateBuckets.get(clientKey) ?? { textTimestamps: [], ttsTimestamps: [] };
+
+  // Opportunistically remove inactive identities so changing connection IPs cannot
+  // leave unbounded, permanently retained rate-limit entries.
+  if (clientRateBuckets.size > 500) {
+    const staleBefore = now - 2 * windowMs;
+    for (const [key, value] of clientRateBuckets.entries()) {
+      if (value.lastSeenAtMs < staleBefore) clientRateBuckets.delete(key);
+    }
+  }
+
+  const entry = clientRateBuckets.get(clientKey) ?? {
+    textTimestamps: [],
+    ttsTimestamps: [],
+    lastSeenAtMs: now,
+  };
+  entry.lastSeenAtMs = now;
   const list = bucket === 'text' ? entry.textTimestamps : entry.ttsTimestamps;
   const limit = bucket === 'text' ? TEXT_RATE_LIMIT_PER_MIN : TTS_RATE_LIMIT_PER_MIN;
 
